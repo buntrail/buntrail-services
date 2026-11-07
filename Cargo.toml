@@ -1,0 +1,28 @@
+[package]
+name = "buntrail-services"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99.1"
+description = "Filesystem, Git, terminal, search and connection services."
+license = "MIT"
+repository = "https://github.com/buntrail/buntrail-services"
+homepage = "https://github.com/buntrail"
+documentation = "https://docs.rs/buntrail-services"
+readme = "README.md"
+authors = ["Bunga Mungil <bungamungil@icloud.com>"]
+
+[features]
+test-support = []
+
+[dependencies]
+buntrail-core = "0.1.0"
+serde = { version = "=1.0.229", features = ["derive", "rc"] }
+futures-core = "=0.3.31"
+base64 = "=0.22.1"
+serde_json = "=1.0.154"
+libc = "=0.2.191"
+tempfile = "=3.27.0"
+sha2 = "=0.10.9"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Threading", "Win32_System_Pipes", "Win32_System_JobObjects", "Win32_System_IO"] }
