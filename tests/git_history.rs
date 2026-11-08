@@ -378,3 +378,60 @@ fn commit_textual_binary_marker_is_text() {
     .unwrap();
     assert_eq!(diff.content, DiffContent::Text);
 }
+
+#[test]
+fn sparse_filtered_history_reads_every_page_without_artificial_topology() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let f = Fixture::new();
+    let mut import = Command::new("git")
+        .arg("-C")
+        .arg(f.p())
+        .args(["fast-import", "--quiet"])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut data = String::new();
+    for index in 0..1400 {
+        let message = if index % 2 == 0 { "MATCH" } else { "excluded" };
+        data += &format!(
+            "commit refs/heads/main\nauthor Fixture <fixture@example.invalid> {} +0000\ncommitter Fixture <fixture@example.invalid> {} +0000\ndata {}\n{}\n\n",
+            1700000000 + index,
+            1700000000 + index,
+            message.len(),
+            message
+        );
+    }
+    import
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(data.as_bytes())
+        .unwrap();
+    assert!(import.wait().unwrap().success());
+    let mut cursor = None;
+    let mut all = std::collections::HashSet::new();
+    loop {
+        let page = run(f.service.history(HistoryQuery {
+            worktree: f.worktree(),
+            ref_filter: vec![],
+            cursor,
+            filter: Some(HistoryFilter {
+                authored_since: None,
+                text: "MATCH".into(),
+            }),
+        }))
+        .expect("simple filtered history must not exhaust graph lanes");
+        for commit in page.commits {
+            assert!(all.insert(commit.oid), "no duplicate commit across pages");
+            assert_eq!(commit.subject, "MATCH");
+        }
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(all.len(), 700);
+}

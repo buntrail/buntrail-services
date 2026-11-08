@@ -211,21 +211,29 @@ impl LocalGitService {
                 .filter(|s| !s.is_empty())
                 .map(oid)
                 .collect::<Result<_, _>>()?;
-            let current = lane(&mut cursor.lanes, &id);
-            cursor.lanes[current] = None;
-            let mut parent_lanes = vec![];
-            for parent in &parents {
-                let p = if parent_lanes.is_empty()
-                    && !cursor.lanes.iter().any(|v| v.as_ref() == Some(parent))
-                {
-                    cursor.lanes[current] = Some(parent.clone());
-                    current
-                } else {
-                    lane(&mut cursor.lanes, parent)
-                };
-                parent_lanes.push(p as u32);
-                cursor.edges.push((id.clone(), parent.clone()));
-            }
+            // Filtered pages omit intermediate parents; those are not unresolved graph lanes.
+            let (current, parent_lanes) = if filter.is_none() {
+                let current = lane(&mut cursor.lanes, &id);
+                cursor.lanes[current] = None;
+                let mut parent_lanes = vec![];
+                for parent in &parents {
+                    let p = if parent_lanes.is_empty()
+                        && !cursor.lanes.iter().any(|v| v.as_ref() == Some(parent))
+                    {
+                        cursor.lanes[current] = Some(parent.clone());
+                        current
+                    } else {
+                        lane(&mut cursor.lanes, parent)
+                    };
+                    parent_lanes.push(p as u32);
+                    cursor.edges.push((id.clone(), parent.clone()));
+                }
+                (current, parent_lanes)
+            } else {
+                cursor.lanes.clear();
+                cursor.edges.clear();
+                (0, vec![])
+            };
             commits.push(GraphCommit {
                 oid: id.clone(),
                 parents,
