@@ -169,6 +169,9 @@ impl LocalGitService {
                 ));
             }
             let args = match &r.command {
+                GitMutation::Repository(action) => {
+                    self.repository_action_args(&r.worktree, action, cancel)?
+                }
                 GitMutation::Stage(paths) | GitMutation::Unstage(paths) => {
                     if paths.is_empty() {
                         return Err(CoreError::new(
@@ -260,6 +263,7 @@ impl LocalGitService {
                 }
             };
             let network_intent = super::network::intent(&root, &r.command, cancel);
+            self.retain_merge_context(&r)?;
             let mut record = Record {
                 envelope: OperationEnvelope {
                     id,
@@ -325,6 +329,12 @@ impl LocalGitService {
             } else {
                 self.state(&root, cancel)
             };
+            let before_execution = before_execution.and_then(|state| {
+                if let GitMutation::Repository(action) = &r.command {
+                    self.repository_action_args(&r.worktree, action, cancel)?;
+                }
+                Ok(state)
+            });
             if before_execution.as_ref() != Ok(&execution_expected) {
                 record.receipt = match before_execution {
                     Ok(state) => OperationReceipt {
@@ -355,7 +365,18 @@ impl LocalGitService {
                 }
                 return Ok(record.receipt);
             }
-            let output = process::run(&root, &args, cancel);
+            let mut output = process::run(&root, &args, cancel);
+            let diagnostic = output
+                .as_ref()
+                .ok()
+                .filter(|v| !v.success)
+                .map(|v| v.diagnostic());
+            if output.as_ref().is_ok_and(|v| !v.interrupted)
+                && self.reconcile_merge(&r, &AtomicBool::new(false), diagnostic)
+                && let Ok(output) = &mut output
+            {
+                output.success = true;
+            }
             // Reconciliation ignores cancellation: the original process has exited; never replay it.
             let observed = self.state(&root, &AtomicBool::new(false));
             let reconciliation_cancel = AtomicBool::new(false);
@@ -372,13 +393,29 @@ impl LocalGitService {
                 })
             };
             record.receipt = match (output, observed) {
-                (Ok(output), Ok(state)) if output.success => OperationReceipt {
-                    id,
-                    state: OperationState::Confirmed(MutationResult::GitChanged {
-                        worktree: r.worktree.clone(),
-                        state,
-                    }),
-                },
+                (Ok(output), Ok(state)) if output.success => {
+                    match self.repository_outcome(&r, &state) {
+                        Ok(outcome) => OperationReceipt {
+                            id,
+                            state: OperationState::Confirmed(MutationResult::GitChanged {
+                                worktree: r.worktree.clone(),
+                                state,
+                                outcome,
+                            }),
+                        },
+                        Err(error) => OperationReceipt {
+                            id,
+                            state: OperationState::Unknown(ReconciliationEvidence {
+                                target: target.clone(),
+                                observed: ObservedState::Git {
+                                    worktree: r.worktree.clone(),
+                                    state,
+                                },
+                                explanation: error.message,
+                            }),
+                        },
+                    }
+                }
                 (Ok(output), Ok(state)) => {
                     let mut message = if network_intent.is_some() {
                         // Transport stderr may contain credential-bearing URLs.

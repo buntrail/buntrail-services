@@ -12,3 +12,6 @@ pub mod proof_codec;
 pub mod worktree_proof;
 
 pub mod authentication;
+
+mod commit;
+mod repository;

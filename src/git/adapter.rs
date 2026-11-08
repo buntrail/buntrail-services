@@ -356,6 +356,9 @@ impl LocalGitService {
         r: DiffRequest,
         cancel: &AtomicBool,
     ) -> Result<DiffSnapshot, CoreError> {
+        if matches!(r.source, DiffSource::Commit(_)) {
+            return self.commit_diff_sync(r, cancel);
+        }
         let root = self.validate(&r.worktree, cancel)?;
         let snapshot = self.status_sync(r.worktree.clone(), cancel)?;
         let expected = snapshot.state;
@@ -461,6 +464,17 @@ fn line(bytes: &[u8]) -> Result<&[u8], CoreError> {
         .ok_or_else(|| io_error("Incomplete Git identity output"))
 }
 impl GitService for LocalGitService {
+    fn commit(&self, query: CommitQuery) -> ServiceFuture<'_, Result<CommitPage, CoreError>> {
+        Box::pin(async move { self.commit_sync(query, &AtomicBool::new(false)) })
+    }
+
+    fn repository(
+        &self,
+        worktree: WorktreeIdentity,
+    ) -> ServiceFuture<'_, Result<GitRepositorySnapshot, CoreError>> {
+        Box::pin(async move { self.repository_sync(worktree, &AtomicBool::new(false)) })
+    }
+
     fn read_query(
         &self,
         worktree: WorktreeIdentity,

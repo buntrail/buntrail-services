@@ -12,7 +12,7 @@ Add to your Cargo.toml after the initial registry release:
 
 ```toml
 [dependencies]
-buntrail-services = "0.1.0"
+buntrail-services = "0.2.0"
 serde_json = "=1.0.154"
 ```
 

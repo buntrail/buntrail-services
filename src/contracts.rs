@@ -28,6 +28,27 @@ pub trait SearchService: Send + Sync {
     ) -> ServiceFuture<'_, Result<EventStream<SearchEvent>, CoreError>>;
 }
 pub trait GitService: Send + Sync {
+    fn commit(&self, _query: CommitQuery) -> ServiceFuture<'_, Result<CommitPage, CoreError>> {
+        Box::pin(async {
+            Err(CoreError::new(
+                ErrorCode::Unavailable,
+                "Commit inspection unavailable",
+            ))
+        })
+    }
+
+    fn repository(
+        &self,
+        _worktree: WorktreeIdentity,
+    ) -> ServiceFuture<'_, Result<GitRepositorySnapshot, CoreError>> {
+        Box::pin(async {
+            Err(CoreError::new(
+                ErrorCode::Unavailable,
+                "Repository inspection unavailable",
+            ))
+        })
+    }
+
     fn read_query(
         &self,
         _worktree: WorktreeIdentity,

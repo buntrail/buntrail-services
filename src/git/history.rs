@@ -8,6 +8,7 @@ use std::{
     ffi::{OsStr, OsString},
     os::unix::ffi::OsStrExt,
     sync::atomic::AtomicBool,
+    time::Instant,
 };
 
 const PAGE_SIZE: usize = 200;
@@ -57,8 +58,16 @@ impl LocalGitService {
                 "Choose at most 16 bounded history refs",
             ));
         }
+        let filter = query.filter.as_ref();
+        if filter.is_some_and(|f| f.text.len() > 4096) {
+            return Err(io_error("History filter exceeds 4096 bytes"));
+        }
         let fingerprint: [u8; 32] = Sha256::digest(
-            serde_json::to_vec(&(&query.worktree, &query.ref_filter)).map_err(io_error)?,
+            match filter {
+                Some(filter) => serde_json::to_vec(&(&query.worktree, &query.ref_filter, filter)),
+                None => serde_json::to_vec(&(&query.worktree, &query.ref_filter)),
+            }
+            .map_err(io_error)?,
         )
         .into();
         let mut cursor = if let Some(bytes) = query.cursor {
@@ -142,30 +151,60 @@ impl LocalGitService {
             })?;
             decorations.entry(id).or_default().push(fields[2].to_vec());
         }
-        let mut args = process::args(&[
-            "log",
-            "--topo-order",
-            "-z",
-            "--no-show-signature",
-            "--format=%H%x00%P%x00%s%x00%an%x00%aI%x00%B",
-        ]);
-        args.push(format!("--max-count={}", PAGE_SIZE + 1).into());
-        args.push(format!("--skip={}", cursor.offset).into());
-        args.extend(cursor.tips.iter().map(OsString::from));
-        args.push("--".into());
-        let raw = self.command(&root, &args, cancel)?;
-        let fields: Vec<_> = raw.split(|b| *b == 0).collect();
-        if fields.last() != Some(&&b""[..]) || (fields.len() - 1) % 6 != 0 {
-            return Err(io_error("Incomplete history page"));
-        }
-        let more = (fields.len() - 1) / 6 > PAGE_SIZE;
+        let started = Instant::now();
+        let needle = filter.map(|f| f.text.to_lowercase()).unwrap_or_default();
+        let mut selected: Vec<Vec<Vec<u8>>> = vec![];
+        let mut scanned = cursor.offset;
+        let more = 'scan: loop {
+            if started.elapsed() >= process::DEADLINE {
+                return Err(io_error("History filtering exceeded deadline; narrow refs"));
+            }
+            let mut args = process::args(&[
+                "log",
+                "--topo-order",
+                "-z",
+                "--no-show-signature",
+                "--format=%H%x00%P%x00%s%x00%an%x00%aI%x00%B%x00%at",
+            ]);
+            args.push(format!("--max-count={}", PAGE_SIZE + 1).into());
+            args.push(format!("--skip={scanned}").into());
+            args.extend(cursor.tips.iter().map(OsString::from));
+            args.push("--".into());
+            let raw = self.command(&root, &args, cancel)?;
+            let fields: Vec<_> = raw.split(|b| *b == 0).collect();
+            if fields.last() != Some(&&b""[..]) || (fields.len() - 1) % 7 != 0 {
+                return Err(io_error("Incomplete history page"));
+            }
+            let rows = fields[..fields.len() - 1].as_chunks::<7>().0;
+            for row in rows {
+                let authored = std::str::from_utf8(row[6])
+                    .map_err(io_error)?
+                    .parse::<i64>()
+                    .map_err(io_error)?;
+                let matches_date = filter
+                    .and_then(|f| f.authored_since)
+                    .is_none_or(|since| authored >= since);
+                let matches_text = needle.is_empty()
+                    || [row[0], row[3], row[5]]
+                        .iter()
+                        .any(|v| String::from_utf8_lossy(v).to_lowercase().contains(&needle));
+                if matches_date && matches_text {
+                    if selected.len() == PAGE_SIZE {
+                        break 'scan true;
+                    }
+                    selected.push(row[..6].iter().map(|v| v.to_vec()).collect());
+                }
+                scanned = scanned
+                    .checked_add(1)
+                    .ok_or_else(|| io_error("History offset exhausted"))?;
+            }
+            if rows.len() < PAGE_SIZE + 1 {
+                break false;
+            }
+        };
         let mut commits = vec![];
-        for fields in fields[..fields.len() - 1]
-            .as_chunks::<6>()
-            .0
-            .iter()
-            .take(PAGE_SIZE)
-        {
+        for owned in &selected {
+            let fields = owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
             let id = oid(fields[0])?;
             let parents: Vec<_> = fields[1]
                 .split(|b| *b == b' ')
@@ -202,10 +241,7 @@ impl LocalGitService {
         let known: HashSet<_> = commits.iter().map(|c| c.oid.as_str()).collect();
         cursor.edges.retain(|(_, to)| !known.contains(to.as_str()));
         let continuation_edges = cursor.edges.clone();
-        cursor.offset = cursor
-            .offset
-            .checked_add(commits.len() as u64)
-            .ok_or_else(|| io_error("History offset exhausted"))?;
+        cursor.offset = scanned;
         let next_cursor = if more {
             let bytes = serde_json::to_vec(&cursor).map_err(io_error)?;
             if bytes.len() > 65536 || cursor.lanes.len() > 512 || cursor.edges.len() > 512 {

@@ -962,3 +962,366 @@ fn interrupted_fetch_and_pull_record_fetched_refs_and_fetch_head() {
         );
     }
 }
+
+#[test]
+fn branch_actions_preserve_worktree() {
+    let f = Fixture::new();
+    f.file("file", b"base\r\n");
+    f.commit();
+    let oid = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let parsed = serde_json::from_value::<GitMutation>(
+        serde_json::json!({"Repository":{"CreateBranch":{"name":b"feat/new".to_vec(),"source_ref":b"refs/heads/main".to_vec(),"start_oid":oid}}}),
+    );
+    assert!(parsed.is_ok(), "Typed branch creation must be supported");
+    let result = run(f.service.mutate(GitMutationRequest {
+        operation: OperationID([71; 16]),
+        worktree: f.worktree(),
+        expected: f.status().state,
+        command: parsed.unwrap(),
+    }));
+    assert!(
+        matches!(result.state, OperationState::Confirmed(_)),
+        "{result:?}"
+    );
+    assert_eq!(git(&f.p(), &["symbolic-ref", "--short", "HEAD"]), b"main\n");
+    assert_eq!(
+        git(&f.p(), &["rev-parse", "refs/heads/feat/new"]),
+        git(&f.p(), &["rev-parse", "HEAD"])
+    );
+    assert_eq!(fs::read(f.p().join("file")).unwrap(), b"base\r\n");
+}
+
+#[test]
+fn branch_actions_revalidate_refs() {
+    let f = Fixture::new();
+    f.file("file", b"base");
+    f.commit();
+    let oid = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let created = f.mutate(GitMutation::Repository(RepositoryAction::CreateBranch {
+        name: b"topic".to_vec(),
+        source_ref: b"refs/heads/main".to_vec(),
+        start_oid: oid.clone(),
+    }));
+    assert!(matches!(created.state, OperationState::Confirmed(_)));
+    let duplicate = f.mutate(GitMutation::Repository(RepositoryAction::CreateBranch {
+        name: b"topic".to_vec(),
+        source_ref: b"refs/heads/main".to_vec(),
+        start_oid: oid.clone(),
+    }));
+    assert!(matches!(duplicate.state, OperationState::Failed(_)));
+    let renamed = f.mutate(GitMutation::Repository(RepositoryAction::RenameBranch {
+        name: b"topic".to_vec(),
+        new_name: b"feat/renamed".to_vec(),
+        expected_oid: oid.clone(),
+    }));
+    assert!(
+        matches!(renamed.state, OperationState::Confirmed(_)),
+        "{renamed:?}"
+    );
+    let tag = f.mutate(GitMutation::Repository(RepositoryAction::CreateTag {
+        name: b"v1".to_vec(),
+        source_ref: b"refs/heads/main".to_vec(),
+        start_oid: oid.clone(),
+    }));
+    assert!(matches!(tag.state, OperationState::Confirmed(_)));
+    let current = f.mutate(GitMutation::Repository(RepositoryAction::DeleteBranch {
+        name: b"main".to_vec(),
+        expected_oid: oid.clone(),
+    }));
+    assert!(matches!(current.state, OperationState::Failed(_)));
+    let stale = f.mutate(GitMutation::Repository(RepositoryAction::RenameBranch {
+        name: b"feat/renamed".to_vec(),
+        new_name: b"other".to_vec(),
+        expected_oid: "0".repeat(40),
+    }));
+    assert!(matches!(stale.state, OperationState::Failed(_)));
+    let deleted = f.mutate(GitMutation::Repository(RepositoryAction::DeleteBranch {
+        name: b"feat/renamed".to_vec(),
+        expected_oid: oid,
+    }));
+    assert!(
+        matches!(deleted.state, OperationState::Confirmed(_)),
+        "{deleted:?}"
+    );
+}
+
+#[test]
+fn external_merge_has_no_abort_authority() {
+    let f = Fixture::new();
+    f.file("file", b"base");
+    f.commit();
+    let parsed = serde_json::from_value::<GitMutation>(
+        serde_json::json!({"Repository":{"AbortMerge":{"session":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]}}}),
+    );
+    assert!(parsed.is_ok(), "Typed guarded abort must exist");
+    let receipt = f.mutate(parsed.unwrap());
+    assert!(matches!(receipt.state, OperationState::Failed(_)));
+    assert_eq!(fs::read(f.p().join("file")).unwrap(), b"base");
+}
+
+#[test]
+fn merge_conflicts_continue_without_replay() {
+    let f = Fixture::new();
+    f.file("file", b"base\n");
+    f.commit();
+    git(&f.p(), &["checkout", "-b", "topic"]);
+    f.file("file", b"topic\n");
+    f.commit();
+    let source = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    git(&f.p(), &["checkout", "main"]);
+    f.file("file", b"main\n");
+    f.commit();
+    let receipt = f.mutate(GitMutation::Repository(RepositoryAction::Merge {
+        source_ref: b"refs/heads/topic".to_vec(),
+        source_oid: source,
+    }));
+    assert!(
+        matches!(receipt.state, OperationState::Confirmed(_)),
+        "{receipt:?}"
+    );
+    let merge = run(f.service.repository(f.worktree()))
+        .unwrap()
+        .merge
+        .unwrap();
+    assert_eq!(merge.session, Some(receipt.id));
+    assert_eq!(merge.conflicts.len(), 1);
+    let p = f.file("file", b"resolved\r\n");
+    let staged = f.mutate(GitMutation::Stage(vec![p]));
+    if let OperationState::Failed(failure) = &staged.state {
+        panic!("Stage failed: {}", failure.error.message);
+    }
+    assert!(matches!(staged.state, OperationState::Confirmed(_)));
+    let continued = f.mutate(GitMutation::Repository(RepositoryAction::ContinueMerge {
+        session: Some(receipt.id),
+        expected_heads: merge.heads.clone(),
+        message: "Resolve merge".into(),
+    }));
+    assert!(
+        matches!(continued.state, OperationState::Confirmed(_)),
+        "{continued:?}"
+    );
+    assert!(
+        run(f.service.repository(f.worktree()))
+            .unwrap()
+            .merge
+            .is_none()
+    );
+    assert_eq!(fs::read(f.p().join("file")).unwrap(), b"resolved\r\n");
+    assert_eq!(
+        git(&f.p(), &["log", "-1", "--format=%P"])
+            .split(|b| *b == b' ')
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn abort_revalidates_saved_edits() {
+    let f = Fixture::new();
+    f.file("file", b"base\n");
+    f.commit();
+    git(&f.p(), &["checkout", "-b", "topic"]);
+    f.file("file", b"topic\n");
+    f.commit();
+    let source = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    git(&f.p(), &["checkout", "main"]);
+    f.file("file", b"main\n");
+    f.commit();
+    let receipt = f.mutate(GitMutation::Repository(RepositoryAction::Merge {
+        source_ref: b"refs/heads/topic".to_vec(),
+        source_oid: source,
+    }));
+    assert!(matches!(receipt.state, OperationState::Confirmed(_)));
+    let confirmed = f.status();
+    f.file("file", b"saved after confirmation\n");
+    f.file("untracked", b"keep me");
+    let rejected = run(f.service.mutate(GitMutationRequest {
+        operation: OperationID([91; 16]),
+        worktree: confirmed.worktree,
+        expected: confirmed.state,
+        command: GitMutation::Repository(RepositoryAction::AbortMerge {
+            session: receipt.id,
+        }),
+    }));
+    assert!(matches!(rejected.state, OperationState::Failed(_)));
+    assert_eq!(
+        fs::read(f.p().join("file")).unwrap(),
+        b"saved after confirmation\n"
+    );
+    let aborted = f.mutate(GitMutation::Repository(RepositoryAction::AbortMerge {
+        session: receipt.id,
+    }));
+    assert!(
+        matches!(aborted.state, OperationState::Confirmed(_)),
+        "{aborted:?}"
+    );
+    assert_eq!(fs::read(f.p().join("file")).unwrap(), b"main\n");
+    assert_eq!(fs::read(f.p().join("untracked")).unwrap(), b"keep me");
+    assert!(
+        run(f.service.repository(f.worktree()))
+            .unwrap()
+            .merge
+            .is_none()
+    );
+}
+
+#[test]
+fn stale_merge_context_cannot_authorize_external_abort() {
+    let f = Fixture::new();
+    f.file("file", b"base\n");
+    f.commit();
+    git(&f.p(), &["checkout", "-b", "topic"]);
+    f.file("file", b"topic\n");
+    f.commit();
+    let source = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    git(&f.p(), &["checkout", "main"]);
+    f.file("file", b"main\n");
+    f.commit();
+    let receipt = f.mutate(GitMutation::Repository(RepositoryAction::Merge {
+        source_ref: b"refs/heads/topic".to_vec(),
+        source_oid: source,
+    }));
+    assert!(matches!(receipt.state, OperationState::Confirmed(_)));
+    fn context(dir: &Path) -> Option<std::path::PathBuf> {
+        for entry in fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = context(&path) {
+                    return Some(found);
+                }
+            } else if path.parent()?.file_name()? == "merge-contexts" {
+                return Some(path);
+            }
+        }
+        None
+    }
+    let path = context(&f.dir.path().join("state")).expect("Retained clean merge baseline");
+    let stale = fs::read(&path).unwrap();
+    assert!(matches!(
+        f.mutate(GitMutation::Repository(RepositoryAction::AbortMerge {
+            session: receipt.id
+        }))
+        .state,
+        OperationState::Confirmed(_)
+    ));
+    // Simulate a crash retaining old context after Git has already ended that merge.
+    fs::write(&path, stale).unwrap();
+    let external = Command::new("git")
+        .arg("-C")
+        .arg(f.p())
+        .args(["merge", "--no-edit", "topic"])
+        .output()
+        .unwrap();
+    assert!(!external.status.success());
+    let merge = run(f.service.repository(f.worktree()))
+        .unwrap()
+        .merge
+        .unwrap();
+    assert!(
+        merge.session.is_none(),
+        "An identical later external merge must not inherit abort authority"
+    );
+}
+
+#[test]
+fn failed_merge_commit_remains_known_pending_and_can_continue() {
+    let f = Fixture::new();
+    f.file("file", b"base\n");
+    f.commit();
+    git(&f.p(), &["checkout", "-b", "topic"]);
+    f.file("file", b"topic\n");
+    f.commit();
+    let source = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    git(&f.p(), &["checkout", "main"]);
+    f.file("file", b"main\n");
+    f.commit();
+    let receipt = f.mutate(GitMutation::Repository(RepositoryAction::Merge {
+        source_ref: b"refs/heads/topic".to_vec(),
+        source_oid: source,
+    }));
+    let merge = run(f.service.repository(f.worktree()))
+        .unwrap()
+        .merge
+        .unwrap();
+    let path = f.file("file", b"resolved\n");
+    f.mutate(GitMutation::Stage(vec![path]));
+    let hook = f.p().join(".git/hooks/pre-commit");
+    fs::write(
+        &hook,
+        b"#!/bin/sh\necho fixture-hook-rejected >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let pending = f.mutate(GitMutation::Repository(RepositoryAction::ContinueMerge {
+        session: Some(receipt.id),
+        expected_heads: merge.heads.clone(),
+        message: "Resolve merge".into(),
+    }));
+    assert!(
+        matches!(pending.state, OperationState::Confirmed(_)),
+        "A known pending merge must be inspectable without permanent uncertainty"
+    );
+    assert!(
+        run(f.service.repository(f.worktree()))
+            .unwrap()
+            .merge
+            .is_some()
+    );
+    assert_eq!(fs::read(f.p().join("file")).unwrap(), b"resolved\n");
+    fs::remove_file(hook).unwrap();
+    let done = f.mutate(GitMutation::Repository(RepositoryAction::ContinueMerge {
+        session: Some(receipt.id),
+        expected_heads: merge.heads,
+        message: "Resolve merge".into(),
+    }));
+    assert!(matches!(done.state, OperationState::Confirmed(_)));
+    assert!(
+        run(f.service.repository(f.worktree()))
+            .unwrap()
+            .merge
+            .is_none()
+    );
+}
+
+#[test]
+fn switch_uses_exact_local_branch_identity() {
+    let f = Fixture::new();
+    f.file("file", b"base");
+    f.commit();
+    git(&f.p(), &["branch", "foo"]);
+    git(&f.p(), &["branch", "refs/heads/foo"]);
+    let oid = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let receipt = f.mutate(GitMutation::Repository(RepositoryAction::SwitchBranch {
+        name: b"refs/heads/foo".to_vec(),
+        expected_oid: oid,
+    }));
+    assert!(
+        matches!(receipt.state, OperationState::Confirmed(_)),
+        "{receipt:?}"
+    );
+    assert_eq!(
+        git(&f.p(), &["symbolic-ref", "HEAD"]),
+        b"refs/heads/refs/heads/foo\n"
+    );
+}

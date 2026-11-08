@@ -178,10 +178,7 @@ impl LocalGitService {
         if let Some(receipt) = self.existing_receipt_sync(original)? {
             return Ok(WorktreePreparation::Existing(Box::new(receipt)));
         }
-        if !matches!(
-            original.command,
-            GitMutation::Checkout { .. } | GitMutation::PullFastForward { .. }
-        ) {
+        if !original.command.changes_worktree() {
             return Err(refused("only worktree changes use prepared execution"));
         }
         let store = self.observation_store()?;

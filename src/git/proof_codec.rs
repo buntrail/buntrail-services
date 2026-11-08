@@ -11,6 +11,8 @@ const ORIGINAL: &[u8; 8] = b"BTORIG01";
 const SCRATCH: usize = 65536;
 // Production native Git scalar envelope, also larger than any legacy header scalar.
 const SCALAR: u64 = 65536;
+// JSON escaping expands a bounded 64 KiB merge message and byte reference names.
+const REPOSITORY_SCALAR: u64 = 1024 * 1024;
 pub mod output;
 fn malformed() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid framed proof body")
@@ -228,6 +230,11 @@ pub fn write_original(
         out.write_all(&r.expected.index_fingerprint)?;
         out.write_all(&r.expected.worktree_fingerprint)?;
         match &r.command {
+            GitMutation::Repository(action) => {
+                tag(out, 7)?;
+                bytes(out, &serde_json::to_vec(action).map_err(io::Error::other)?)?;
+            }
+
             GitMutation::Stage(paths) | GitMutation::Unstage(paths) => {
                 tag(
                     out,
@@ -536,6 +543,14 @@ pub fn hash_original(
                 array(&mut input, &mut out)?;
                 out.write_all(b"}}")?;
             }
+            7 => {
+                let action: RepositoryAction =
+                    serde_json::from_slice(&input.bounded(REPOSITORY_SCALAR)?)
+                        .map_err(|_| malformed())?;
+                out.write_all(br#"{"Repository":"#)?;
+                json(&mut out, &action)?;
+                out.write_all(b"}")?;
+            }
             _ => return Err(malformed()),
         }
         out.write_all(b"}")?;
@@ -592,6 +607,10 @@ pub fn read_original(
                 remote: input.bounded(SCALAR)?,
                 reference: input.bounded(SCALAR)?,
             },
+            7 => GitMutation::Repository(
+                serde_json::from_slice(&input.bounded(REPOSITORY_SCALAR)?)
+                    .map_err(|_| malformed())?,
+            ),
             _ => return Err(malformed()),
         };
         Ok(GitMutationRequest {
@@ -655,7 +674,7 @@ mod tests {
             .map(char::from)
             .chain("é水🦀\u{2028}".chars())
             .collect();
-        let commands = vec![
+        let mut commands = vec![
             GitMutation::Stage(vec![
                 TargetPath::PosixBytes(b"/a\xff".to_vec()),
                 TargetPath::PosixBytes(b"/b".to_vec()),
@@ -677,6 +696,44 @@ mod tests {
                 reference: vec![b'r'; 65536],
             },
         ];
+        let actions = vec![
+            RepositoryAction::SwitchBranch {
+                name: vec![255, 120],
+                expected_oid: "a".repeat(40),
+            },
+            RepositoryAction::CreateBranch {
+                name: b"new".to_vec(),
+                source_ref: b"refs/heads/main".to_vec(),
+                start_oid: "a".repeat(40),
+            },
+            RepositoryAction::RenameBranch {
+                name: b"old".to_vec(),
+                new_name: b"new".to_vec(),
+                expected_oid: "a".repeat(40),
+            },
+            RepositoryAction::CreateTag {
+                name: b"v1".to_vec(),
+                source_ref: b"refs/heads/main".to_vec(),
+                start_oid: "a".repeat(40),
+            },
+            RepositoryAction::DeleteBranch {
+                name: b"old".to_vec(),
+                expected_oid: "a".repeat(40),
+            },
+            RepositoryAction::Merge {
+                source_ref: b"refs/heads/main".to_vec(),
+                source_oid: "a".repeat(40),
+            },
+            RepositoryAction::ContinueMerge {
+                session: None,
+                expected_heads: vec!["a".repeat(40)],
+                message: text.clone(),
+            },
+            RepositoryAction::AbortMerge {
+                session: OperationID([9; 16]),
+            },
+        ];
+        commands.extend(actions.into_iter().map(GitMutation::Repository));
         for head in [
             GitHead::Branch {
                 name: vec![0, 255],
@@ -705,10 +762,7 @@ mod tests {
                         identity.wire_digest,
                         <[u8; 32]>::from(Sha256::digest(&bytes))
                     );
-                    if matches!(
-                        command,
-                        GitMutation::Checkout { .. } | GitMutation::PullFastForward { .. }
-                    ) {
+                    if command.changes_worktree() || matches!(command, GitMutation::Repository(_)) {
                         assert_eq!(
                             read_original(Chunks(&bytes, chunk), &identity, &target()).unwrap(),
                             r
