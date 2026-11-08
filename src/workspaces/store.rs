@@ -9,6 +9,22 @@ use std::{
     os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
 };
+// Disk catalogs retain documents and authority, never terminal restoration state.
+fn clear_terminal_state(catalog: &mut serde_json::Value) -> bool {
+    let mut changed = false;
+    if let Some(records) = catalog.get_mut("records").and_then(|v| v.as_array_mut()) {
+        for record in records {
+            if let Some(record) = record.as_object_mut() {
+                for key in ["terminal_layout", "terminal_starts", "terminal_height"] {
+                    changed |= record.remove(key).is_some();
+                }
+                changed |= record.get("terminal_visible") != Some(&serde_json::Value::Bool(false));
+                record.insert("terminal_visible".into(), serde_json::Value::Bool(false));
+            }
+        }
+    }
+    changed
+}
 pub struct WorkspaceStore {
     directory: PathBuf,
     lock: std::sync::Mutex<File>,
@@ -66,7 +82,9 @@ impl WorkspaceStore {
         if bytes.len() > 4 * 1024 * 1024 {
             return Err(io_error("workspace state exceeds limit"));
         }
-        let c: WorkspaceCatalog = serde_json::from_slice(&bytes).map_err(io_error)?;
+        let mut disk: serde_json::Value = serde_json::from_slice(&bytes).map_err(io_error)?;
+        let migrated = clear_terminal_state(&mut disk);
+        let c: WorkspaceCatalog = serde_json::from_value(disk).map_err(io_error)?;
         if c.schema != 1
             || !valid_git_recoveries(&c)
             || c.records.len() > 100
@@ -79,6 +97,9 @@ impl WorkspaceStore {
             })
         {
             return Err(io_error("workspace schema or bounds invalid"));
+        }
+        if migrated {
+            self.write(&c)?;
         }
         Ok(c)
     }
@@ -112,7 +133,9 @@ impl WorkspaceStore {
         self.write(&catalog)
     }
     fn write(&self, catalog: &WorkspaceCatalog) -> Result<(), CoreError> {
-        let bytes = serde_json::to_vec(catalog).map_err(io_error)?;
+        let mut disk = serde_json::to_value(catalog).map_err(io_error)?;
+        clear_terminal_state(&mut disk);
+        let bytes = serde_json::to_vec(&disk).map_err(io_error)?;
         if catalog.schema != 1
             || !valid_git_recoveries(catalog)
             || catalog.records.len() > 100

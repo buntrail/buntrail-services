@@ -130,3 +130,5 @@ Report vulnerabilities privately using [SECURITY.md](SECURITY.md).
 First-party code is [MIT licensed](LICENSE), Copyright (c) 2026 Bunga Mungil.
 Third-party dependencies retain their own licenses. See
 [third-party notices](THIRD_PARTY_NOTICES.md).
+
+Terminal workspace layouts and launch descriptors are session-only. Workspace catalogs retain documents and verified ownership, but do not restore terminals after an application restart. Remote disconnect retention is independent of catalog persistence.

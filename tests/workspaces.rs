@@ -205,7 +205,7 @@ fn workspace_store_retains_latest_preferences_and_missing_entry_identity() {
     record.generation = 2;
     record.show_hidden = false;
     record.show_icons = false;
-    record.terminal_height = Some(176.0);
+
     store.update(record.clone()).unwrap();
     store.update(old).unwrap();
     assert_eq!(store.load().unwrap().records[0], record);
@@ -344,7 +344,7 @@ fn moves_preserve_raw_posix_names_despite_equal_lossy_display() {
 }
 
 #[test]
-fn terminal_topology_and_runtime_survive_workspace_store_reopen() {
+fn terminal_state_is_ephemeral_across_workspace_store_reopen() {
     use buntrail_core::{terminal::layout::SplitOrientation, workspaces::WorkspaceState};
     use buntrail_services::workspaces::store::WorkspaceStore;
     let (dir, service, root) = fixture();
@@ -396,16 +396,57 @@ fn terminal_topology_and_runtime_survive_workspace_store_reopen() {
         .unwrap()
         .load()
         .unwrap();
-    assert_eq!(reopened.records[0].terminal_layout, record.terminal_layout);
-    assert_eq!(
-        reopened.records[0].terminal_layout.runtimes,
-        vec![
-            (
-                TerminalSessionID([2; 16]),
-                OperationID([4; 16]),
-                runtime.clone()
-            ),
-            (TerminalSessionID([3; 16]), OperationID([5; 16]), runtime)
-        ]
-    );
+    assert!(reopened.records[0].terminal_layout.tabs.is_empty());
+    assert!(reopened.records[0].terminal_starts.is_empty());
+    assert!(!reopened.records[0].terminal_visible);
+    let disk: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join("workspaces/workspaces.json")).unwrap())
+            .unwrap();
+    for key in ["terminal_layout", "terminal_starts", "terminal_height"] {
+        assert!(disk["records"][0].get(key).is_none(), "persisted {key}");
+    }
+    assert_eq!(disk["records"][0]["terminal_visible"], false);
+}
+
+#[test]
+fn legacy_terminal_fields_do_not_block_or_destroy_workspace_documents() {
+    use buntrail_core::workspaces::WorkspaceState;
+    use buntrail_services::workspaces::store::WorkspaceStore;
+    let (dir, service, root) = fixture();
+    let store = WorkspaceStore::new(dir.path().join("workspaces")).unwrap();
+    let WorkspaceState::Ready(record) = store.open(root.path, service.target().clone()).unwrap()
+    else {
+        panic!()
+    };
+    let path = dir.path().join("workspaces/workspaces.json");
+    let mut disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    disk["records"][0]["terminal_layout"] = serde_json::json!({"invalid":"old terminal"});
+    disk["records"][0]["terminal_starts"] = serde_json::json!("obsolete");
+    disk["records"][0]["terminal_visible"] = serde_json::json!(true);
+    disk["records"][0]["terminal_height"] = serde_json::json!(-1);
+    fs::write(&path, serde_json::to_vec(&disk).unwrap()).unwrap();
+    assert_eq!(store.load().unwrap().records[0], record);
+    let cleaned: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert!(cleaned["records"][0].get("terminal_layout").is_none());
+    assert_eq!(cleaned["records"][0]["terminal_visible"], false);
+}
+
+#[test]
+fn failed_terminal_migration_preserves_original_catalog() {
+    use buntrail_services::workspaces::store::WorkspaceStore;
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, service, root) = fixture();
+    let directory = dir.path().join("workspaces");
+    let store = WorkspaceStore::new(directory.clone()).unwrap();
+    store.open(root.path, service.target().clone()).unwrap();
+    let path = directory.join("workspaces.json");
+    let mut disk: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    disk["records"][0]["terminal_visible"] = serde_json::json!(true);
+    let original = serde_json::to_vec(&disk).unwrap();
+    fs::write(&path, &original).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
+    let result = store.load();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result.is_err());
+    assert_eq!(fs::read(path).unwrap(), original);
 }
