@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0
+
+File-sidebar operations and compatible shared core contracts. C ABI remains version 1.
+
 ## 0.2.0 — Git Repository
 
 Browse refs and filtered history, inspect immutable first-parent diffs, and execute guarded local branch actions with durable merge continuation and owned abort authority.

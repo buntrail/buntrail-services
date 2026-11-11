@@ -434,3 +434,31 @@ fn fix1_crlf_zero_width_policy() {
         &[(0, 7)],
     );
 }
+
+#[test]
+fn explorer_review_selected_search_is_anchored_to_workspace_not_process_directory() {
+    let (dir, connection, mut request) = setup();
+    std::fs::write(dir.path().join("project/plain"), b"needle\n").unwrap();
+    std::fs::write(dir.path().join("project/unselected"), b"needle\n").unwrap();
+    request.includes = vec!["/plain".into()];
+    let events = collect(&connection, request);
+    let matches = events
+        .iter()
+        .filter_map(|event| {
+            if let SearchEvent::Match(found) = event {
+                Some(found)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(matches.len(), 1, "{events:?}");
+    assert_eq!(
+        matches[0].file.path,
+        TargetPath::posix(
+            std::os::unix::ffi::OsStrExt::as_bytes(dir.path().join("project/plain").as_os_str())
+                .to_vec()
+        )
+        .unwrap()
+    );
+}

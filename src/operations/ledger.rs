@@ -33,6 +33,8 @@ pub struct Record {
     pub terminal_request: Option<TerminalOpenRequest>,
     #[serde(default)]
     pub git_intent: Option<GitNetworkIntent>,
+    #[serde(default)]
+    pub file_destination: Option<TargetPath>,
     pub requested_digest: [u8; 32],
     pub revision: BufferRevision,
     pub receipt: OperationReceipt,
@@ -285,7 +287,22 @@ impl Ledger {
             return Ok(unknown(
                 id,
                 target,
-                "expired or interrupted operation; inspect current contents, never replay",
+                &format!(
+                    "expired or interrupted operation; inspect current contents, never replay; destination: {:?}",
+                    record.file_destination
+                ),
+            ));
+        }
+        if record.file_destination.is_some()
+            && matches!(record.receipt.state, OperationState::Unknown(_))
+        {
+            return Ok(unknown(
+                id,
+                target,
+                &format!(
+                    "File outcome is unresolved; inspect original paths and destination: {:?}; never replay",
+                    record.file_destination
+                ),
             ));
         }
         Ok(record.receipt)
@@ -339,6 +356,7 @@ mod tests {
             save_proof: None,
             terminal_request: None,
             git_intent: None,
+            file_destination: None,
             requested_digest: [2; 32],
             revision: BufferRevision(1),
             receipt: if running {

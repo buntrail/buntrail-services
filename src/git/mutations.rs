@@ -279,6 +279,7 @@ impl LocalGitService {
                 save_proof: None,
                 terminal_request: None,
                 git_intent: network_intent.clone(),
+                file_destination: None,
                 requested_digest: fingerprint,
                 revision: BufferRevision(0),
                 receipt: OperationReceipt {

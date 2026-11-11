@@ -832,6 +832,7 @@ impl LocalFileService {
                 }),
                 terminal_request: None,
                 git_intent: None,
+                file_destination: None,
                 requested_digest: contents,
                 revision: request.submitted_revision,
                 receipt: OperationReceipt {

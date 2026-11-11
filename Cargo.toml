@@ -1,6 +1,6 @@
 [package]
 name = "buntrail-services"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.99.1"
 description = "Filesystem, Git, terminal, search and connection services."
@@ -15,7 +15,7 @@ authors = ["Bunga Mungil <bungamungil@icloud.com>"]
 test-support = []
 
 [dependencies]
-buntrail-core = "0.2.0"
+buntrail-core = "0.3.0"
 serde = { version = "=1.0.229", features = ["derive", "rc"] }
 futures-core = "=0.3.31"
 base64 = "=0.22.1"

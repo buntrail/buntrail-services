@@ -222,6 +222,7 @@ impl LocalTerminalService {
                 save_proof: None,
                 terminal_request: Some(request.clone()),
                 git_intent: None,
+                file_destination: None,
                 requested_digest: hash,
                 revision: BufferRevision(0),
                 receipt: OperationReceipt {

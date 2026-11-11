@@ -15,3 +15,6 @@ mod resolve;
 pub mod document_io;
 mod owned;
 pub use owned::{OwnedLocalFiles, OwnedSave, save_request_digest};
+
+#[cfg(unix)]
+mod trash;

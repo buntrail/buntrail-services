@@ -87,6 +87,7 @@ impl WorkspaceStore {
         let c: WorkspaceCatalog = serde_json::from_value(disk).map_err(io_error)?;
         if c.schema != 1
             || !valid_git_recoveries(&c)
+            || !valid_file_recoveries(&c)
             || c.records.len() > 100
             || c.records.iter().any(|r| {
                 r.documents.len() > 64
@@ -113,7 +114,7 @@ impl WorkspaceStore {
                 .iter_mut()
                 .find(|record| record.id == old.id)
             else {
-                if !old.git_recoveries.is_empty() {
+                if !old.git_recoveries.is_empty() || !old.file_recoveries.is_empty() {
                     return Err(CoreError::new(
                         ErrorCode::Busy,
                         "cannot drop retained Git outcomes in a catalog write",
@@ -128,6 +129,7 @@ impl WorkspaceStore {
                 ));
             }
             record.git_recoveries = old.git_recoveries.clone();
+            record.file_recoveries = old.file_recoveries.clone();
             record.git_recovery_generation = old.git_recovery_generation;
         }
         self.write(&catalog)
@@ -138,6 +140,7 @@ impl WorkspaceStore {
         let bytes = serde_json::to_vec(&disk).map_err(io_error)?;
         if catalog.schema != 1
             || !valid_git_recoveries(catalog)
+            || !valid_file_recoveries(catalog)
             || catalog.records.len() > 100
             || catalog.records.iter().any(|r| {
                 r.terminal_layout.validate().is_err()
@@ -219,6 +222,7 @@ impl WorkspaceStore {
                 graph_filters: vec![],
                 git_recoveries: vec![],
                 git_recovery_generation: 0,
+                file_recoveries: vec![],
             }
         };
         c.records.insert(0, record.clone());
@@ -265,6 +269,7 @@ impl WorkspaceStore {
         if old.generation < record.generation {
             // Navigation/selection writes cannot replace worker-persisted operation references.
             record.git_recoveries = old.git_recoveries.clone();
+            record.file_recoveries = old.file_recoveries.clone();
             record.git_recovery_generation = old.git_recovery_generation;
             *old = record;
         }
@@ -275,7 +280,7 @@ impl WorkspaceStore {
         let mut c = self.read()?;
         if c.records
             .iter()
-            .any(|r| r.id == id && !r.git_recoveries.is_empty())
+            .any(|r| r.id == id && (!r.git_recoveries.is_empty() || !r.file_recoveries.is_empty()))
         {
             return Err(CoreError::new(
                 ErrorCode::Busy,
@@ -392,6 +397,108 @@ impl WorkspaceStore {
                 .git_recovery_generation
                 .checked_add(1)
                 .ok_or_else(|| io_error("Git recovery generation exhausted"))?;
+        }
+        let record = record.clone();
+        self.write(&catalog)?;
+        Ok(record)
+    }
+    /// Only this locked path adds references; insertion durably precedes target admission.
+    pub fn retain_file_recovery(
+        &self,
+        workspace: WorkspaceID,
+        reference: FileRecoveryReference,
+    ) -> Result<(WorkspaceRecord, bool), CoreError> {
+        let _lock = self.guard()?;
+        let mut catalog = self.read()?;
+        if let Some(record) = catalog.records.iter().find(|r| {
+            r.file_recoveries
+                .iter()
+                .any(|old| old.operation == reference.operation)
+        }) {
+            let old = record
+                .file_recoveries
+                .iter()
+                .find(|r| r.operation == reference.operation)
+                .unwrap();
+            if old.file != reference.file
+                || old.owner != reference.owner
+                || old.destination != reference.destination
+                || old.kind != reference.kind
+                || old.request_digest != reference.request_digest
+            {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidArgument,
+                    "original File recovery identity/digest differs",
+                ));
+            }
+            return Ok((record.clone(), false));
+        }
+        if let Some(old) = catalog
+            .records
+            .iter()
+            .flat_map(|r| &r.file_recoveries)
+            .find(|old| old.file.target == reference.file.target)
+        {
+            return Err(CoreError {code:ErrorCode::Busy,message:"Inspect the retained original file outcome before another mutation in this repository".into(),context:ErrorContext::Operation(old.operation)});
+        }
+        let client = catalog.client;
+        let record = catalog
+            .records
+            .iter_mut()
+            .find(|r| r.id == workspace)
+            .ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::Closed,
+                    "File recovery workspace is no longer saved",
+                )
+            })?;
+        if record.target != reference.file.target
+            || reference.owner.workspace != workspace
+            || reference.owner.lease != record.lease
+            || reference.owner.client != client
+        {
+            return Err(CoreError::new(
+                ErrorCode::TargetChanged,
+                "File recovery owner/target differs",
+            ));
+        }
+        record.file_recoveries.push(reference);
+        let record = record.clone();
+        self.write(&catalog)?;
+        Ok((record, true))
+    }
+    /// Called only after an authoritative terminal receipt or proven current unsent cancellation.
+    pub fn resolve_file_recovery(
+        &self,
+        workspace: WorkspaceID,
+        reference: &FileRecoveryReference,
+    ) -> Result<WorkspaceRecord, CoreError> {
+        let _lock = self.guard()?;
+        let mut catalog = self.read()?;
+        let record = catalog
+            .records
+            .iter_mut()
+            .find(|r| r.id == workspace)
+            .ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::Closed,
+                    "original File recovery workspace is no longer saved",
+                )
+            })?;
+        if let Some(old) = record
+            .file_recoveries
+            .iter()
+            .find(|old| old.operation == reference.operation)
+        {
+            if old != reference {
+                return Err(CoreError::new(
+                    ErrorCode::TargetChanged,
+                    "File recovery reference changed before resolution",
+                ));
+            }
+            record
+                .file_recoveries
+                .retain(|old| old.operation != reference.operation);
         }
         let record = record.clone();
         self.write(&catalog)?;
@@ -553,4 +660,24 @@ fn valid_git_recoveries(catalog: &WorkspaceCatalog) -> bool {
             && matches!(&reference.worktree.canonical_path,TargetPath::PosixBytes(bytes) if bytes.len()<=65536 && bytes.first()==Some(&b'/') && !bytes.contains(&0))
             && seen.insert(reference.operation)
     }))
+}
+
+fn valid_file_recoveries(catalog: &WorkspaceCatalog) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    let path_valid = |path: &TargetPath| {
+        matches!(path, TargetPath::PosixBytes(bytes)
+        if bytes.len() <= 65536 && bytes.first() == Some(&b'/') && !bytes.contains(&0))
+    };
+    catalog.records.iter().all(|record| {
+        record.file_recoveries.len() <= 64
+            && record.file_recoveries.iter().all(|reference| {
+                reference.file.target == record.target
+                    && reference.owner.workspace == record.id
+                    && reference.owner.lease == record.lease
+                    && reference.owner.client == catalog.client
+                    && path_valid(&reference.file.path)
+                    && reference.destination.as_ref().is_none_or(path_valid)
+                    && seen.insert(reference.operation)
+            })
+    })
 }

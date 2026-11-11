@@ -113,11 +113,16 @@ impl LocalFileService {
                 }
             };
             validate()?;
+            let trash = if matches!(request.command, FileMutation::Trash) {
+                Some(super::trash::prepare(&original, request.operation)?)
+            } else {
+                None
+            };
             let destination = match &request.command {
                 FileMutation::Rename { destination } | FileMutation::Move { destination } => {
                     Some(path(destination)?)
                 }
-                FileMutation::Trash => Some(trash_destination(&original)?),
+                FileMutation::Trash => Some(trash.as_ref().unwrap().destination.clone()),
                 _ => None,
             };
             if let Some(dest) = &destination {
@@ -152,6 +157,7 @@ impl LocalFileService {
                 save_proof: None,
                 terminal_request: None,
                 git_intent: None,
+                file_destination: destination.as_ref().map(|p| target_path(p)),
                 requested_digest: command_digest,
                 revision: BufferRevision(0),
                 receipt: OperationReceipt {
@@ -166,6 +172,9 @@ impl LocalFileService {
             let mut effected = false;
             let effect = (|| -> Result<MutationResult, CoreError> {
                 validate()?;
+                if let Some(trash) = &trash {
+                    super::trash::write_info(trash)?;
+                }
                 match &request.command {
                     FileMutation::Create { .. } => {
                         let parent = original
@@ -218,7 +227,10 @@ impl LocalFileService {
                     FileMutation::Delete | FileMutation::Remove | FileMutation::Trash
                 );
                 let mut file = request.file.clone();
-                if let Some(dest) = destination.as_ref().filter(|_| !removed) {
+                if let Some(dest) = destination
+                    .as_ref()
+                    .filter(|_| !removed || matches!(request.command, FileMutation::Trash))
+                {
                     file.path = target_path(dest);
                 }
                 file.resolved_identity = None;
@@ -290,44 +302,6 @@ pub(crate) fn rename_exclusive(_: &Path, _: &Path) -> Result<(), CoreError> {
         "exclusive rename unavailable on this platform",
     ))
 }
-fn trash_destination(original: &Path) -> Result<std::path::PathBuf, CoreError> {
-    #[cfg(target_os = "macos")]
-    {
-        let home = std::env::var_os("HOME").ok_or_else(|| io_error("home unavailable"))?;
-        let trash = std::path::PathBuf::from(home).join(".Trash");
-        let m = fs::symlink_metadata(&trash).map_err(io_error)?;
-        if !m.is_dir()
-            || m.uid() != unsafe { libc::geteuid() }
-            || m.dev() != fs::symlink_metadata(original).map_err(io_error)?.dev()
-        {
-            return Err(CoreError::new(
-                ErrorCode::Unavailable,
-                "Trash unavailable for this volume; choose permanent deletion explicitly",
-            ));
-        }
-        let suffix = crate::connections::local::new_id()?;
-        let mut name = original
-            .file_name()
-            .ok_or_else(|| io_error("missing name"))?
-            .to_os_string();
-        name.push(format!(
-            ".{}",
-            suffix
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>()
-        ));
-        Ok(trash.join(name))
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = original;
-        Err(CoreError::new(
-            ErrorCode::Unavailable,
-            "local Trash unavailable",
-        ))
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -390,5 +364,26 @@ mod tests {
         );
         assert_eq!(fs::read(project.join("keep")).unwrap(), b"keep");
         assert_eq!(fs::read(alias).unwrap(), b"external longer change");
+    }
+}
+
+#[cfg(test)]
+mod explorer_trash_tests {
+    use super::*;
+    #[test]
+    fn explorer_trash_rejects_nonempty_directories_without_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("folder");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("kept"), b"kept").unwrap();
+        assert!(super::super::trash::prepare(&source, OperationID([4; 16])).is_err());
+        assert_eq!(fs::read(source.join("kept")).unwrap(), b"kept");
+    }
+    #[test]
+    fn explorer_trash_metadata_preserves_hostile_path_bytes() {
+        assert_eq!(
+            super::super::trash::info_text(Path::new("/a b/%\n"), "2026-11-11T12:00:00"),
+            "[Trash Info]\nPath=/a%20b/%25%0A\nDeletionDate=2026-11-11T12:00:00\n"
+        );
     }
 }

@@ -139,6 +139,7 @@ impl LocalSearchService {
         }
         let root = crate::files::path(&r.root.path)?;
         let mut command = Command::new(&self.executable);
+        command.current_dir(&root);
         command.args([
             "--no-config",
             "--json",
@@ -173,7 +174,7 @@ impl LocalSearchService {
             .arg("--regexp")
             .arg(&expression)
             .arg("--")
-            .arg(root)
+            .arg(".")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
