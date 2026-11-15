@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1 — Failed-push review
+
+Align first-party dependencies with the corrective 0.4.1 Git sidebar release; no API or behavior changes in this crate.
+
 ## 0.4.0 — Git sidebar
 
 Add scoped paged history, first-parent binary-aware summaries and sanitized repository context; include untracked paths in repository snapshots. Preserve guarded mutations and exact bytes. Push the captured checked-out commit to the explicit upstream branch even when local/upstream names differ.
