@@ -15,3 +15,7 @@ pub mod authentication;
 
 mod commit;
 mod repository;
+
+mod summary;
+
+mod sidebar_context;

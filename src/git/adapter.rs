@@ -464,6 +464,19 @@ fn line(bytes: &[u8]) -> Result<&[u8], CoreError> {
         .ok_or_else(|| io_error("Incomplete Git identity output"))
 }
 impl GitService for LocalGitService {
+    fn sidebar_history(
+        &self,
+        query: GitSidebarHistoryQuery,
+    ) -> ServiceFuture<'_, Result<GraphPage, CoreError>> {
+        Box::pin(async move { self.sidebar_history_sync(query, &AtomicBool::new(false)) })
+    }
+    fn commit_summary(
+        &self,
+        query: CommitQuery,
+    ) -> ServiceFuture<'_, Result<GitCommitSummary, CoreError>> {
+        Box::pin(async move { self.commit_summary_sync(query, &AtomicBool::new(false)) })
+    }
+
     fn commit(&self, query: CommitQuery) -> ServiceFuture<'_, Result<CommitPage, CoreError>> {
         Box::pin(async move { self.commit_sync(query, &AtomicBool::new(false)) })
     }

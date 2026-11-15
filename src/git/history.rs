@@ -46,24 +46,51 @@ impl LocalGitService {
         query: HistoryQuery,
         cancel: &AtomicBool,
     ) -> Result<GraphPage, CoreError> {
+        let scope = if query.ref_filter.is_empty() {
+            GitHistoryScope::Head
+        } else {
+            GitHistoryScope::References(query.ref_filter.clone())
+        };
+        self.history_scoped(query, scope, false, cancel)
+    }
+    pub fn sidebar_history_sync(
+        &self,
+        query: GitSidebarHistoryQuery,
+        cancel: &AtomicBool,
+    ) -> Result<GraphPage, CoreError> {
+        query.scope.validate()?;
+        let refs = match &query.scope {
+            GitHistoryScope::References(refs) => refs.clone(),
+            _ => vec![],
+        };
+        self.history_scoped(
+            HistoryQuery {
+                worktree: query.worktree,
+                ref_filter: refs,
+                cursor: query.cursor,
+                filter: None,
+            },
+            query.scope,
+            true,
+            cancel,
+        )
+    }
+    fn history_scoped(
+        &self,
+        query: HistoryQuery,
+        scope: GitHistoryScope,
+        sidebar: bool,
+        cancel: &AtomicBool,
+    ) -> Result<GraphPage, CoreError> {
+        scope.validate()?;
         let root = self.validate(&query.worktree, cancel)?;
-        if query.ref_filter.len() > 16
-            || query
-                .ref_filter
-                .iter()
-                .any(|r| r.is_empty() || r.len() > 4096 || r.contains(&0))
-        {
-            return Err(CoreError::new(
-                ErrorCode::InvalidArgument,
-                "Choose at most 16 bounded history refs",
-            ));
-        }
         let filter = query.filter.as_ref();
         if filter.is_some_and(|f| f.text.len() > 4096) {
             return Err(io_error("History filter exceeds 4096 bytes"));
         }
         let fingerprint: [u8; 32] = Sha256::digest(
             match filter {
+                _ if sidebar => serde_json::to_vec(&(&query.worktree, &scope)),
                 Some(filter) => serde_json::to_vec(&(&query.worktree, &query.ref_filter, filter)),
                 None => serde_json::to_vec(&(&query.worktree, &query.ref_filter)),
             }
@@ -77,7 +104,7 @@ impl LocalGitService {
             let c: Cursor =
                 serde_json::from_slice(&bytes).map_err(|_| io_error("Invalid history cursor"))?;
             if c.query != fingerprint
-                || c.tips.len() > 16
+                || c.tips.len() > 512
                 || c.lanes.len() > 512
                 || c.edges.len() > 512
                 || c.tips
@@ -92,10 +119,33 @@ impl LocalGitService {
             }
             c
         } else {
-            let filters = if query.ref_filter.is_empty() {
-                vec![b"HEAD".to_vec()]
-            } else {
-                query.ref_filter.clone()
+            let filters = match &scope {
+                GitHistoryScope::Head => vec![b"HEAD".to_vec()],
+                GitHistoryScope::References(refs) => refs.clone(),
+                GitHistoryScope::All => {
+                    let raw = self.command(
+                        &root,
+                        &process::args(&[
+                            "for-each-ref",
+                            "--format=%(refname)%00%(objecttype)%00%(*objecttype)",
+                            "refs/heads",
+                            "refs/remotes",
+                            "refs/tags",
+                        ]),
+                        cancel,
+                    )?;
+                    let mut refs = vec![];
+                    for row in raw.split(|b| *b == b'\n').filter(|r| !r.is_empty()) {
+                        let fields = row.split(|b| *b == 0).collect::<Vec<_>>();
+                        if fields.len() != 3 {
+                            return Err(io_error("Invalid history reference"));
+                        }
+                        if fields[1] == b"commit" || fields[2] == b"commit" {
+                            refs.push(fields[0].to_vec());
+                        }
+                    }
+                    refs
+                }
             };
             let mut tips = vec![];
             for reference in filters {
@@ -105,15 +155,21 @@ impl LocalGitService {
                 );
                 let output = process::run(&root, &args, cancel)?;
                 if !output.success
-                    && query.ref_filter.is_empty()
+                    && scope == GitHistoryScope::Head
                     && matches!(self.state(&root, cancel)?.head, GitHead::Unborn(_))
                 {
                     continue;
                 }
                 let bytes = output.checked()?;
-                tips.push(oid(bytes
+                let tip = oid(bytes
                     .strip_suffix(b"\n")
-                    .ok_or_else(|| io_error("Incomplete history tip"))?)?);
+                    .ok_or_else(|| io_error("Incomplete history tip"))?)?;
+                if !tips.contains(&tip) {
+                    tips.push(tip);
+                }
+                if tips.len() > 512 {
+                    return Err(io_error("History exceeds 512 distinct tips; narrow refs"));
+                }
             }
             Cursor {
                 query: fingerprint,
@@ -250,6 +306,9 @@ impl LocalGitService {
         cursor.edges.retain(|(_, to)| !known.contains(to.as_str()));
         let continuation_edges = cursor.edges.clone();
         cursor.offset = scanned;
+        if cursor.lanes.len() > 512 || cursor.edges.len() > 512 {
+            return Err(io_error("History topology exceeds bound; narrow refs"));
+        }
         let next_cursor = if more {
             let bytes = serde_json::to_vec(&cursor).map_err(io_error)?;
             if bytes.len() > 65536 || cursor.lanes.len() > 512 || cursor.edges.len() > 512 {

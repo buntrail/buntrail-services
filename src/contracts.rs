@@ -28,6 +28,29 @@ pub trait SearchService: Send + Sync {
     ) -> ServiceFuture<'_, Result<EventStream<SearchEvent>, CoreError>>;
 }
 pub trait GitService: Send + Sync {
+    fn sidebar_history(
+        &self,
+        _query: GitSidebarHistoryQuery,
+    ) -> ServiceFuture<'_, Result<GraphPage, CoreError>> {
+        Box::pin(async {
+            Err(CoreError::new(
+                ErrorCode::Unavailable,
+                "Git sidebar history unavailable",
+            ))
+        })
+    }
+    fn commit_summary(
+        &self,
+        _query: CommitQuery,
+    ) -> ServiceFuture<'_, Result<GitCommitSummary, CoreError>> {
+        Box::pin(async {
+            Err(CoreError::new(
+                ErrorCode::Unavailable,
+                "Git commit summary unavailable",
+            ))
+        })
+    }
+
     fn commit(&self, _query: CommitQuery) -> ServiceFuture<'_, Result<CommitPage, CoreError>> {
         Box::pin(async {
             Err(CoreError::new(

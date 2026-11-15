@@ -153,6 +153,7 @@ impl LocalGitService {
                 })?;
             }
         }
+        let sidebar = Some(self.sidebar_context(&root, &snapshot.state.head, cancel)?);
         if self.state(&root, cancel)? != snapshot.state {
             return Err(CoreError::new(
                 ErrorCode::StaleRevision,
@@ -160,12 +161,18 @@ impl LocalGitService {
             ));
         }
         let mut changes = snapshot.staged.clone();
-        for entry in snapshot.unstaged.iter().chain(&snapshot.conflicts) {
+        for entry in snapshot
+            .unstaged
+            .iter()
+            .chain(&snapshot.untracked)
+            .chain(&snapshot.conflicts)
+        {
             if !changes.iter().any(|v| v.path == entry.path) {
                 changes.push(entry.clone());
             }
         }
         Ok(GitRepositorySnapshot {
+            sidebar,
             changes,
             worktree,
             state: snapshot.state,

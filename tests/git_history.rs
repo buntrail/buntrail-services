@@ -435,3 +435,297 @@ fn sparse_filtered_history_reads_every_page_without_artificial_topology() {
     }
     assert_eq!(all.len(), 700);
 }
+
+#[test]
+fn git_sidebar_all_and_explicit_refs_exceed_legacy_limit() {
+    let f = Fixture::new();
+    f.file("base", b"base\n");
+    f.commit();
+    let mut refs = vec![];
+    for n in 0..33 {
+        let name = format!("refs/heads/topic-{n}");
+        git(&f.p(), &["update-ref", &name, "HEAD"]);
+        refs.push(name.into_bytes());
+    }
+    git(&f.p(), &["tag", "-a", "v1", "-m", "tag"]);
+    for scope in [GitHistoryScope::All, GitHistoryScope::References(refs)] {
+        let page = run(f.service.sidebar_history(GitSidebarHistoryQuery {
+            worktree: f.worktree(),
+            scope,
+            cursor: None,
+        }))
+        .unwrap();
+        assert_eq!(page.commits.len(), 1);
+        assert!(
+            page.commits[0]
+                .decorations
+                .contains(&b"refs/tags/v1".to_vec())
+        );
+    }
+    assert!(
+        run(f.service.sidebar_history(GitSidebarHistoryQuery {
+            worktree: f.worktree(),
+            scope: GitHistoryScope::References(vec![]),
+            cursor: None
+        }))
+        .is_err()
+    );
+}
+#[test]
+fn git_sidebar_summary_uses_first_parent_and_counts_binary_and_renames() {
+    let f = Fixture::new();
+    f.file("old\tname\n", b"one\ntwo\n");
+    f.file("binary", b"\0\x01");
+    f.commit();
+    let root = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let summary = run(f.service.commit_summary(CommitQuery {
+        worktree: f.worktree(),
+        oid: root,
+        cursor: None,
+    }))
+    .unwrap();
+    assert_eq!(
+        (
+            summary.changed_file_count,
+            summary.insertion_count,
+            summary.deletion_count,
+            summary.binary_file_count
+        ),
+        (2, 2, 0, 1)
+    );
+    git(&f.p(), &["mv", "old\tname\n", "new\nname"]);
+    f.file("binary", b"\0\x02");
+    f.commit();
+    let oid = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let summary = run(f.service.commit_summary(CommitQuery {
+        worktree: f.worktree(),
+        oid,
+        cursor: None,
+    }))
+    .unwrap();
+    assert_eq!(
+        (
+            summary.changed_file_count,
+            summary.insertion_count,
+            summary.deletion_count,
+            summary.binary_file_count
+        ),
+        (2, 0, 0, 1)
+    );
+}
+
+#[test]
+fn git_sidebar_context_selects_upstream_remote_and_sanitizes_github() {
+    let f = Fixture::new();
+    f.file("base", b"base\n");
+    f.commit();
+    git(
+        &f.p(),
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/fallback/repo.git",
+        ],
+    );
+    git(
+        &f.p(),
+        &["remote", "add", "work", "git@github.com:owner/project.git"],
+    );
+    git(&f.p(), &["config", "branch.main.remote", "work"]);
+    git(&f.p(), &["config", "branch.main.merge", "refs/heads/main"]);
+    let context = run(f.service.repository(f.worktree()))
+        .unwrap()
+        .sidebar
+        .unwrap();
+    assert_eq!(context.upstream.unwrap().remote, b"work");
+    assert_eq!(
+        context.github_commit_base_url.as_deref(),
+        Some("https://github.com/owner/project/commit/")
+    );
+    for url in [
+        "https://token@github.com/owner/project.git",
+        "https://github.com.evil/owner/project",
+        "https://github.com/owner/../bad",
+        "https://github.com/owner/repo?secret=x",
+    ] {
+        git(&f.p(), &["config", "remote.work.url", url]);
+        assert!(
+            run(f.service.repository(f.worktree()))
+                .unwrap()
+                .sidebar
+                .unwrap()
+                .github_commit_base_url
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn git_sidebar_cursors_bind_scope_and_worktree_and_freeze_tips() {
+    let f = Fixture::new();
+    f.file("base", b"base\n");
+    f.commit();
+    let tree = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD^{tree}"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let mut tip = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    for n in 0..203 {
+        tip = String::from_utf8(git(
+            &f.p(),
+            &[
+                "-c",
+                "user.name=Fixture",
+                "commit-tree",
+                &tree,
+                "-p",
+                &tip,
+                "-m",
+                &format!("row {n}"),
+            ],
+        ))
+        .unwrap()
+        .trim()
+        .to_owned();
+    }
+    git(&f.p(), &["update-ref", "refs/heads/main", &tip]);
+    let worktree = f.worktree();
+    let first = run(f.service.sidebar_history(GitSidebarHistoryQuery {
+        worktree: worktree.clone(),
+        scope: GitHistoryScope::Head,
+        cursor: None,
+    }))
+    .unwrap();
+    assert_eq!(first.commits.len(), 200);
+    assert!(!first.continuation_edges.is_empty());
+    let cursor = first.next_cursor.unwrap();
+    assert!(
+        run(f.service.sidebar_history(GitSidebarHistoryQuery {
+            worktree: worktree.clone(),
+            scope: GitHistoryScope::All,
+            cursor: Some(cursor.clone())
+        }))
+        .is_err()
+    );
+    let other = Fixture::new();
+    assert!(
+        run(other.service.sidebar_history(GitSidebarHistoryQuery {
+            worktree: other.worktree(),
+            scope: GitHistoryScope::Head,
+            cursor: Some(cursor.clone())
+        }))
+        .is_err()
+    );
+    git(&f.p(), &["commit", "--allow-empty", "-m", "new tip"]);
+    let last = run(f.service.sidebar_history(GitSidebarHistoryQuery {
+        worktree,
+        scope: GitHistoryScope::Head,
+        cursor: Some(cursor),
+    }))
+    .unwrap();
+    assert_eq!(last.commits.len(), 4);
+    assert!(last.next_cursor.is_none());
+}
+
+#[test]
+fn git_sidebar_four_parent_merge_preserves_topology_and_first_parent_summary() {
+    let f = Fixture::new();
+    f.file("base", b"base\n");
+    f.commit();
+    let root = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let tree = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD^{tree}"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let mut parents = vec![];
+    for n in 0..4 {
+        parents.push(
+            String::from_utf8(git(
+                &f.p(),
+                &[
+                    "commit-tree",
+                    &tree,
+                    "-p",
+                    &root,
+                    "-m",
+                    &format!("parent {n}"),
+                ],
+            ))
+            .unwrap()
+            .trim()
+            .to_owned(),
+        );
+    }
+    let mut args = vec!["commit-tree", tree.as_str()];
+    for parent in &parents {
+        args.extend(["-p", parent.as_str()]);
+    }
+    args.extend(["-m", "merge"]);
+    let tip = String::from_utf8(git(&f.p(), &args))
+        .unwrap()
+        .trim()
+        .to_owned();
+    git(&f.p(), &["update-ref", "refs/heads/main", &tip]);
+    let page = run(f.service.sidebar_history(GitSidebarHistoryQuery {
+        worktree: f.worktree(),
+        scope: GitHistoryScope::All,
+        cursor: None,
+    }))
+    .unwrap();
+    assert_eq!(page.commits[0].parents, parents);
+    let lanes = page.commits[0]
+        .parent_lanes
+        .iter()
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(lanes.len(), 4);
+    let summary = run(f.service.commit_summary(CommitQuery {
+        worktree: f.worktree(),
+        oid: tip,
+        cursor: None,
+    }))
+    .unwrap();
+    assert_eq!(summary.changed_file_count, 0);
+}
+
+#[test]
+fn git_sidebar_repository_includes_untracked_and_partial_status_without_path_loss() {
+    let f = Fixture::new();
+    let tracked = f.file("partial", b"one\n");
+    f.commit();
+    f.file("partial", b"two\n");
+    git(&f.p(), &["add", "partial"]);
+    f.file("partial", b"three\n");
+    let untracked = f.file("new\nfile", b"new\n");
+    let snapshot = run(f.service.repository(f.worktree())).unwrap();
+    assert_eq!(
+        snapshot
+            .changes
+            .iter()
+            .find(|e| e.path == tracked)
+            .unwrap()
+            .status,
+        "MM"
+    );
+    assert_eq!(
+        snapshot
+            .changes
+            .iter()
+            .find(|e| e.path == untracked)
+            .unwrap()
+            .status,
+        "??"
+    );
+}

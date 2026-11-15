@@ -132,3 +132,17 @@ Third-party dependencies retain their own licenses. See
 [third-party notices](THIRD_PARTY_NOTICES.md).
 
 Terminal workspace layouts and launch descriptors are session-only. Workspace catalogs retain documents and verified ownership, but do not restore terminals after an application restart. Remote disconnect retention is independent of catalog persistence.
+
+### Git sidebar reads
+
+`GitService::sidebar_history` accepts verified worktree identity and an explicit
+Head, All, or References scope. Pages retain resolved tips, 200 commits and
+continuation topology. Explicit refs allow 512 entries / 4096 bytes per entry /
+32768 combined bytes. Traversals reject more than 512 distinct tips or
+lanes/continuation edges and cursors larger than 65536 bytes instead of omitting
+results. Refresh begins a new traversal.
+
+`commit_summary` reads NUL-delimited numstat against the first parent (empty tree
+for roots). Binary changes count as files and binaries without textual totals.
+Repository snapshots optionally expose raw-byte upstream remote/ref and a
+sanitized GitHub commit base URL; credential URLs are never returned there.
