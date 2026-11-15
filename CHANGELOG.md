@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.0 — Git sidebar
+
+Add scoped paged history, first-parent binary-aware summaries and sanitized repository context; include untracked paths in repository snapshots. Preserve guarded mutations and exact bytes.
+
 ## 0.3.0
 
 File-sidebar operations and compatible shared core contracts. C ABI remains version 1.
