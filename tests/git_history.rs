@@ -714,6 +714,14 @@ fn git_sidebar_repository_includes_untracked_and_partial_status_without_path_los
         snapshot
             .changes
             .iter()
+            .filter(|e| e.path == tracked)
+            .count(),
+        1
+    );
+    assert_eq!(
+        snapshot
+            .changes
+            .iter()
             .find(|e| e.path == tracked)
             .unwrap()
             .status,
@@ -762,4 +770,31 @@ fn git_sidebar_all_includes_nested_tag_only_history_and_decoration() {
         .find(|c| c.oid == orphan)
         .expect("All must retain nested-tag-only commit");
     assert!(release.decorations.contains(&b"refs/tags/outer".to_vec()));
+}
+
+#[test]
+fn git_sidebar_preserves_staged_delete_and_untracked_recreation_at_same_path() {
+    let f = Fixture::new();
+    let original = f.file("file", b"base\r\n");
+    f.commit();
+    git(&f.p(), &["mv", "file", "renamed"]);
+    f.file("file", b"unrelated recreated source\r\n");
+    f.file("renamed", b"modified destination\r\n");
+    git(&f.p(), &["add", "--all", "--", "renamed"]);
+    let snapshot = run(f.service.repository(f.worktree())).unwrap();
+    let statuses = snapshot
+        .changes
+        .iter()
+        .filter(|e| e.path == original)
+        .map(|e| e.status.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        ["D ", "??"],
+        "Distinct index/worktree records must not be deduplicated by path"
+    );
+    assert_eq!(
+        fs::read(f.p().join("file")).unwrap(),
+        b"unrelated recreated source\r\n"
+    );
 }

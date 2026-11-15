@@ -167,7 +167,7 @@ impl LocalGitService {
             .chain(&snapshot.untracked)
             .chain(&snapshot.conflicts)
         {
-            if !changes.iter().any(|v| v.path == entry.path) {
+            if !changes.contains(entry) {
                 changes.push(entry.clone());
             }
         }

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2 — Lossless Git snapshots
+
+Retain distinct staged-deletion and untracked-recreation records at the same raw path; deduplicate only identical status entries.
+
 ## 0.4.1 — Failed-push review
 
 Align first-party dependencies with the corrective 0.4.1 Git sidebar release; no API or behavior changes in this crate.
