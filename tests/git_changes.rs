@@ -803,23 +803,14 @@ fn interrupted_push_never_qualifies_local_snapshot_as_remote_reconciliation() {
         );
         let remote = if scenario == 1 { &moved } else { &bare };
         assert_eq!(
-            git(
-                remote,
-                &[
-                    "rev-parse",
-                    if scenario == 4 || scenario == 5 {
-                        "refs/heads/deploy"
-                    } else {
-                        "refs/heads/main"
-                    }
-                ]
-            ),
+            git(remote, &["rev-parse", "refs/heads/main"]),
             git(&f.p(), &["rev-parse", "HEAD"])
         );
         if scenario == 4 || scenario == 5 {
             assert_eq!(
                 git(remote, &["for-each-ref", "--format=%(refname)"]),
-                b"refs/heads/deploy\n"
+                b"refs/heads/main\n",
+                "Explicit upstream destination must override configured push mapping"
             );
         }
         let OperationState::Unknown(evidence) = &receipt.state else {
@@ -1324,4 +1315,29 @@ fn switch_uses_exact_local_branch_identity() {
         git(&f.p(), &["symbolic-ref", "HEAD"]),
         b"refs/heads/refs/heads/foo\n"
     );
+}
+
+#[test]
+fn git_sidebar_push_sends_checked_out_commit_to_differently_named_upstream() {
+    let f = Fixture::new();
+    f.file("base", b"base\n");
+    f.commit();
+    let bare = f.dir.path().join("origin.git");
+    fs::create_dir(&bare).unwrap();
+    git(&bare, &["init", "--bare"]);
+    git(&f.p(), &["remote", "add", "origin", bare.to_str().unwrap()]);
+    git(&f.p(), &["push", "origin", "main"]);
+    git(&f.p(), &["checkout", "-b", "topic"]);
+    f.file("topic", b"topic\n");
+    f.commit();
+    let expected = git(&f.p(), &["rev-parse", "HEAD"]);
+    let receipt = f.mutate(GitMutation::Push {
+        remote: b"origin".to_vec(),
+        reference: b"refs/heads/main".to_vec(),
+    });
+    assert!(
+        matches!(receipt.state, OperationState::Confirmed(_)),
+        "{receipt:?}"
+    );
+    assert_eq!(git(&bare, &["rev-parse", "refs/heads/main"]), expected);
 }

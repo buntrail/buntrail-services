@@ -729,3 +729,37 @@ fn git_sidebar_repository_includes_untracked_and_partial_status_without_path_los
         "??"
     );
 }
+
+#[test]
+fn git_sidebar_all_includes_nested_tag_only_history_and_decoration() {
+    let f = Fixture::new();
+    f.file("base", b"base\n");
+    f.commit();
+    let tree = String::from_utf8(git(&f.p(), &["rev-parse", "HEAD^{tree}"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    let orphan = String::from_utf8(git(
+        &f.p(),
+        &["commit-tree", &tree, "-m", "tag-only release"],
+    ))
+    .unwrap()
+    .trim()
+    .to_owned();
+    git(&f.p(), &["tag", "-a", "inner", &orphan, "-m", "inner"]);
+    git(&f.p(), &["tag", "-a", "outer", "inner", "-m", "outer"]);
+    git(&f.p(), &["tag", "-d", "inner"]);
+    git(&f.p(), &["tag", "-a", "tree-tag", &tree, "-m", "noncommit"]);
+    let page = run(f.service.sidebar_history(GitSidebarHistoryQuery {
+        worktree: f.worktree(),
+        scope: GitHistoryScope::All,
+        cursor: None,
+    }))
+    .unwrap();
+    let release = page
+        .commits
+        .iter()
+        .find(|c| c.oid == orphan)
+        .expect("All must retain nested-tag-only commit");
+    assert!(release.decorations.contains(&b"refs/tags/outer".to_vec()));
+}

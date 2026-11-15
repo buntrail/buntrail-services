@@ -251,7 +251,24 @@ impl LocalGitService {
                         ])
                     };
                     args.push(argument(remote)?);
-                    args.push(argument(reference)?);
+                    if matches!(r.command, GitMutation::Push { .. }) {
+                        let GitHead::Branch { oid, .. } = &r.expected.head else {
+                            return Err(CoreError::new(
+                                ErrorCode::InvalidArgument,
+                                "Select a checked-out branch before pushing",
+                            ));
+                        };
+                        if !reference.starts_with(b"refs/heads/") {
+                            return Err(CoreError::new(
+                                ErrorCode::InvalidArgument,
+                                "Select a full upstream branch reference",
+                            ));
+                        }
+                        let source = super::repository::oid(oid.as_bytes())?;
+                        args.push(argument(&[source.as_bytes(), b":", reference].concat())?);
+                    } else {
+                        args.push(argument(reference)?);
+                    }
                     args
                 }
                 GitMutation::Checkout { reference } => {
