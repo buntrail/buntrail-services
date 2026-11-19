@@ -1018,3 +1018,5 @@ pub mod terminal;
 
 #[cfg(unix)]
 pub mod git;
+mod welcome;
+pub use welcome::welcome_folder;

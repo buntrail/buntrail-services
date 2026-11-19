@@ -433,7 +433,19 @@ impl EngineHost {
         })
     }
     pub fn ssh(connector: SshConnector) -> Result<Self, CoreError> {
+        Self::verified_ssh(connector, None)
+    }
+    pub fn verified_ssh(
+        connector: SshConnector,
+        expected: Option<&TargetIdentity>,
+    ) -> Result<Self, CoreError> {
         let probe = connector.probe()?;
+        if expected.is_some_and(|identity| probe.identity.as_ref() != Some(identity)) {
+            return Err(CoreError::new(
+                ErrorCode::TargetChanged,
+                "Selected SSH host identity changed",
+            ));
+        }
         let binding = probe
             .identity
             .ok_or_else(|| {
