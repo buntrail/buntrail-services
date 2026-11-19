@@ -1,6 +1,6 @@
 [package]
 name = "buntrail-services"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.99.1"
 description = "Filesystem, Git, terminal, search and connection services."

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0
+
+Support target-side folder creation and repository cloning.
+
 ## 0.4.2 — Lossless Git snapshots
 
 Retain distinct staged-deletion and untracked-recreation records at the same raw path; deduplicate only identical status entries.
