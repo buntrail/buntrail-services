@@ -938,3 +938,109 @@ fn inactive_pending_inspection_preserves_text_and_rejects_live_or_wrong_receipts
     );
     service.recovery.discard(id).unwrap();
 }
+
+#[test]
+fn explicit_discard_keeps_save_reference_without_recoverable_text() {
+    use serde_json::json;
+
+    let (dir, service, file) = setup();
+    let id = DocumentID([89; 16]);
+    let mut doc = DocumentSession::from_loaded(service.load_sync(file, id).unwrap());
+    doc.apply_transaction(EditTransaction {
+        expected_revision: BufferRevision(0),
+        source_view: ViewID(1),
+        intent: EditIntent::Replace,
+        replacements: vec![Replacement {
+            range: BufferRange {
+                revision: BufferRevision(0),
+                start: 0,
+                end: 8,
+            },
+            text: "discard this text".into(),
+        }],
+    })
+    .unwrap();
+    let pending = doc.prepare_save(OperationID([90; 16])).unwrap().recovery;
+    let state = dir.path().join("state");
+    let api = buntrail_services::Services::with_state_directory(state.clone());
+    api.local_connection().unwrap();
+    let store =
+        buntrail_services::recovery::store::RecoveryStore::new(state.join("files/recovery"))
+            .unwrap();
+    store.write_sync(pending.clone()).unwrap();
+    drop(doc);
+
+    assert!(
+        api.call(&json!({"command":"recovery.discard","document":id}))
+            .is_err()
+    );
+    let discard = json!({"command":"recovery.discard","document":id,"retain_pending_save":true});
+    let journal = state.join("files/recovery");
+    fs::create_dir(journal.join("epoch")).unwrap();
+    assert!(api.call(&discard).is_err());
+    assert_eq!(
+        api.call(&json!({"command":"recovery.read","document":id}))
+            .unwrap()["text"],
+        "discard this text\r\n"
+    );
+    fs::remove_dir(journal.join("epoch")).unwrap();
+    api.call(&discard).unwrap();
+    api.call(&discard).unwrap();
+    store.write_sync(pending.clone()).unwrap();
+    let record = fs::read(journal.join(format!("{}.draft", "59".repeat(16)))).unwrap();
+    let header_size = u32::from_be_bytes(record[..4].try_into().unwrap()) as usize;
+    assert_eq!(record.len(), 4 + header_size);
+    let header: serde_json::Value = serde_json::from_slice(&record[4..]).unwrap();
+    assert_eq!(header["schema"], 2);
+    assert!(header.get("text_sha256").is_none());
+    assert!(
+        api.call(&json!({"command":"recovery.read","document":id}))
+            .is_err()
+    );
+    let inventory = api.call(&json!({"command":"recovery.list"})).unwrap();
+    let entry = &inventory["entries"][0];
+    assert_eq!(entry["document"], json!(id));
+    assert_eq!(entry["recoverable"], false);
+    assert_eq!(entry["unknown_save"], true);
+    assert_eq!(entry["local"], false);
+
+    let operation = pending.pending_operation.unwrap();
+    let target = pending.file.target;
+    let unknown = OperationReceipt {
+        id: operation,
+        state: OperationState::Running,
+    };
+    store
+        .inspect_pending(id, |seen, binding| {
+            assert_eq!(seen, operation);
+            assert_eq!(binding, target);
+            Ok(unknown)
+        })
+        .unwrap();
+    assert!(
+        store
+            .inspect_pending(id, |_, _| Ok(OperationReceipt {
+                id: OperationID([0; 16]),
+                state: OperationState::Running,
+            }))
+            .is_err()
+    );
+    assert_eq!(store.inventory().unwrap().len(), 1);
+    let mut wrong_target = target.clone();
+    wrong_target.filesystem_namespace.push(4);
+    let mismatched = buntrail_services::files::failure(
+        operation,
+        wrong_target,
+        CoreError::new(ErrorCode::Io, "wrong target"),
+    );
+    assert!(store.inspect_pending(id, |_, _| Ok(mismatched)).is_err());
+    assert_eq!(store.inventory().unwrap().len(), 1);
+    let failed = buntrail_services::files::failure(
+        operation,
+        target,
+        CoreError::new(ErrorCode::Io, "save did not run"),
+    );
+    store.inspect_pending(id, |_, _| Ok(failed)).unwrap();
+    assert!(store.inventory().unwrap().is_empty());
+    assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"original\r\n");
+}

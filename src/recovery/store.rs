@@ -17,17 +17,35 @@ struct Header {
     epoch: u64,
     clean: bool,
     document: DocumentID,
-    revision: BufferRevision,
-    encoding: Encoding,
-    line_endings: LineEndings,
-    language: Option<String>,
     file: FileRef,
     version: FileVersion,
     pending_operation: Option<OperationID>,
     pending_revision: Option<BufferRevision>,
+    #[serde(flatten)]
+    draft: Option<DraftMetadata>,
+}
+#[derive(Serialize, Deserialize)]
+struct DraftMetadata {
+    revision: BufferRevision,
+    encoding: Encoding,
+    line_endings: LineEndings,
+    language: Option<String>,
     provisional_composition: bool,
     text_sha256: [u8; 32],
 }
+impl DraftMetadata {
+    fn clean_marker(revision: BufferRevision) -> Self {
+        Self {
+            revision,
+            encoding: Encoding::Utf8 { bom: false },
+            line_endings: LineEndings::Lf,
+            language: None,
+            provisional_composition: false,
+            text_sha256: Sha256::digest([]).into(),
+        }
+    }
+}
+
 pub struct RecoveryStore {
     directory: PathBuf,
     write_lock: Mutex<()>,
@@ -97,9 +115,16 @@ impl RecoveryStore {
         self.sessions.session_is_live(&Self::name(id))
     }
     pub fn discard(&self, id: DocumentID) -> Result<(), CoreError> {
+        self.discard_with_pending(id, false)
+    }
+    pub fn discard_with_pending(
+        &self,
+        id: DocumentID,
+        retain_pending_save: bool,
+    ) -> Result<(), CoreError> {
         let _lock = self.write_lock.lock().map_err(io_error)?;
         let _disk = self.disk_lock()?;
-        let (header, _) = match self.header(id) {
+        let (mut header, _) = match self.header(id) {
             Ok(value) => value,
             Err(_error) if !self.path(id).exists() => return Ok(()),
             Err(error) => return Err(error),
@@ -107,37 +132,33 @@ impl RecoveryStore {
         if header.clean {
             return Ok(());
         }
-        if header.pending_operation.is_some() {
+        if header.pending_operation.is_some() && !retain_pending_save {
             return Err(CoreError::new(
                 ErrorCode::Unknown,
                 "Inspect the uncertain save before deleting its recovery draft",
             ));
         }
         let _owner = self.sessions.exclusive_session(&Self::name(id))?;
+        if header.schema == 2 {
+            return Ok(());
+        }
         let generation = header
             .generation
             .checked_add(1)
             .ok_or_else(|| io_error("Recovery generation exhausted"))?;
         let epoch = self.next_epoch()?;
-        self.write_locked(RecoverySnapshot {
-            snapshot: DocumentSnapshot {
-                document: id,
-                revision: header.revision,
-                text: Arc::new(Text::from("")),
-                encoding: header.encoding,
-                line_endings: header.line_endings,
-                language: header.language,
-            },
-            file: header.file,
-            version: header.version,
-            pending_operation: None,
-            pending_revision: None,
-            provisional_composition: false,
-            generation,
-            epoch,
-            lease: None,
-            clean: true,
-        })
+        if header.pending_operation.is_some() {
+            header.schema = 2;
+            header.draft = None;
+            header.generation = generation;
+            header.epoch = epoch;
+            return self.persist(&header, None);
+        }
+        header.clean = true;
+        header.generation = generation;
+        header.epoch = epoch;
+        header.draft = Some(DraftMetadata::clean_marker(header.draft.unwrap().revision));
+        self.persist(&header, None)
     }
     /// Observation only; a confirmed receipt never discards recovered text.
     pub fn inspect_pending(
@@ -146,15 +167,20 @@ impl RecoveryStore {
         inspect: impl FnOnce(OperationID, TargetIdentity) -> Result<OperationReceipt, CoreError>,
     ) -> Result<OperationReceipt, CoreError> {
         let _owner = self.sessions.exclusive_session(&Self::name(id))?;
-        let (mut snapshot, _budget) = self.preview_budgeted(id)?;
-        let operation = snapshot.pending_operation.ok_or_else(|| {
+        let (header, _) = self.header(id)?;
+        let draft = if header.schema == 1 {
+            Some(self.preview_budgeted(id)?)
+        } else {
+            None
+        };
+        let operation = header.pending_operation.ok_or_else(|| {
             CoreError::new(ErrorCode::InvalidArgument, "Recovery has no pending save")
         })?;
-        let receipt = inspect(operation, snapshot.file.target.clone())?;
-        let target = &snapshot.file.target;
+        let receipt = inspect(operation, header.file.target.clone())?;
+        let target = &header.file.target;
         let resolved = match &receipt.state {
             OperationState::Confirmed(MutationResult::Saved(saved))
-                if Some(saved.saved_revision) == snapshot.pending_revision
+                if Some(saved.saved_revision) == header.pending_revision
                     && &saved.version.target == target =>
             {
                 true
@@ -176,17 +202,34 @@ impl RecoveryStore {
             let _lock = self.write_lock.lock().map_err(io_error)?;
             let _disk = self.disk_lock()?;
             let (current, _) = self.header(id)?;
-            if current.epoch != snapshot.epoch
-                || current.generation != snapshot.generation
+            if current.schema != header.schema
+                || current.epoch != header.epoch
+                || current.pending_revision != header.pending_revision
+                || current.generation != header.generation
                 || current.pending_operation != Some(operation)
-                || current.file != snapshot.file
-                || current.version != snapshot.version
+                || current.file != header.file
+                || current.version != header.version
             {
                 return Err(CoreError::new(
                     ErrorCode::StaleRevision,
                     "Recovery changed during inspection",
                 ));
             }
+            let Some((mut snapshot, _budget)) = draft else {
+                let mut clean = current;
+                clean.schema = 1;
+                clean.clean = true;
+                clean.draft = Some(DraftMetadata::clean_marker(clean.pending_revision.unwrap()));
+                clean.pending_operation = None;
+                clean.pending_revision = None;
+                clean.generation = clean
+                    .generation
+                    .checked_add(1)
+                    .ok_or_else(|| io_error("Recovery generation exhausted"))?;
+                clean.epoch = self.next_epoch()?;
+                self.persist(&clean, None)?;
+                return Ok(receipt);
+            };
             snapshot.pending_operation = None;
             snapshot.pending_revision = None;
             snapshot.generation = snapshot
@@ -219,7 +262,17 @@ impl RecoveryStore {
         let mut bytes = vec![0; length];
         file.read_exact(&mut bytes).map_err(io_error)?;
         let header: Header = serde_json::from_slice(&bytes).map_err(io_error)?;
-        if header.schema != 1
+        let valid_schema = match header.schema {
+            1 => header.draft.is_some(),
+            2 => {
+                header.draft.is_none()
+                    && !header.clean
+                    && header.pending_operation.is_some()
+                    && file.metadata().map_err(io_error)?.len() == length as u64 + 4
+            }
+            _ => false,
+        };
+        if !valid_schema
             || header.document != id
             || header.file.target != header.version.target
             || header.pending_operation.is_some() != header.pending_revision.is_some()
@@ -228,8 +281,17 @@ impl RecoveryStore {
         }
         Ok((header, file))
     }
-    /// Metadata only; corrupt/unsupported files remain visible and are never removed here.
     pub fn inventory(&self) -> Result<Vec<buntrail_core::workspaces::RecoveryEntry>, CoreError> {
+        Ok(self
+            .inventory_with_recoverability()?
+            .into_iter()
+            .map(|(entry, _)| entry)
+            .collect())
+    }
+    /// Metadata only; corrupt/unsupported files remain visible and are never removed here.
+    pub(crate) fn inventory_with_recoverability(
+        &self,
+    ) -> Result<Vec<(buntrail_core::workspaces::RecoveryEntry, bool)>, CoreError> {
         let mut found = vec![];
         for entry in fs::read_dir(&self.directory).map_err(io_error)? {
             let entry = entry.map_err(io_error)?;
@@ -246,21 +308,27 @@ impl RecoveryStore {
             }
             let document = DocumentID(bytes);
             match self.header(document) {
-                Ok((h, _)) if !h.clean => found.push(buntrail_core::workspaces::RecoveryEntry {
-                    document,
-                    file: Some(h.file),
-                    provisional: h.provisional_composition,
-                    unknown_save: h.pending_operation.is_some(),
-                    error: None,
-                }),
+                Ok((h, _)) if !h.clean => found.push((
+                    buntrail_core::workspaces::RecoveryEntry {
+                        document,
+                        file: Some(h.file),
+                        provisional: h.draft.is_some_and(|draft| draft.provisional_composition),
+                        unknown_save: h.pending_operation.is_some(),
+                        error: None,
+                    },
+                    h.schema == 1,
+                )),
                 Ok(_) => {}
-                Err(error) => found.push(buntrail_core::workspaces::RecoveryEntry {
-                    document,
-                    file: None,
-                    provisional: false,
-                    unknown_save: false,
-                    error: Some(error),
-                }),
+                Err(error) => found.push((
+                    buntrail_core::workspaces::RecoveryEntry {
+                        document,
+                        file: None,
+                        provisional: false,
+                        unknown_save: false,
+                        error: Some(error),
+                    },
+                    false,
+                )),
             }
             if found.len() > 64 {
                 return Err(io_error("draft discovery exceeds 64 document limit"));
@@ -270,25 +338,50 @@ impl RecoveryStore {
     }
     pub fn discover(&self) -> Result<Vec<(DocumentID, FileRef)>, CoreError> {
         Ok(self
-            .inventory()?
+            .inventory_with_recoverability()?
             .into_iter()
-            .filter_map(|e| e.file.map(|f| (e.document, f)))
+            .filter(|(_, recoverable)| *recoverable)
+            .filter_map(|(e, _)| e.file.map(|f| (e.document, f)))
             .collect())
     }
     pub fn write_sync(&self, snapshot: RecoverySnapshot) -> Result<(), CoreError> {
+        self.write_sync_mode(snapshot, false)
+    }
+    pub(super) fn write_sync_mode(
+        &self,
+        snapshot: RecoverySnapshot,
+        metadata_only: bool,
+    ) -> Result<(), CoreError> {
         let _lock = self.write_lock.lock().map_err(io_error)?;
         let _disk = self.disk_lock()?;
-        self.write_locked(snapshot)
+        self.write_mode_locked(snapshot, metadata_only)
     }
     fn write_locked(&self, snapshot: RecoverySnapshot) -> Result<(), CoreError> {
-        if snapshot.snapshot.text.len() > MAX_DOCUMENT_BYTES {
+        self.write_mode_locked(snapshot, false)
+    }
+    fn write_mode_locked(
+        &self,
+        snapshot: RecoverySnapshot,
+        metadata_only: bool,
+    ) -> Result<(), CoreError> {
+        if metadata_only
+            && (snapshot.clean
+                || snapshot.pending_operation.is_none()
+                || snapshot.pending_revision.is_none())
+        {
+            return Err(io_error("Recovery save reference is incomplete"));
+        }
+        if !metadata_only && snapshot.snapshot.text.len() > MAX_DOCUMENT_BYTES {
             return Err(CoreError::new(
                 ErrorCode::Unavailable,
                 "draft exceeds editable limit",
             ));
         }
         if let Ok((old, _)) = self.header(snapshot.snapshot.document) {
-            if (old.epoch, old.generation) > (snapshot.epoch, snapshot.generation) {
+            if (old.epoch, old.generation) > (snapshot.epoch, snapshot.generation)
+                || (old.schema == 2
+                    && (old.epoch, old.generation) == (snapshot.epoch, snapshot.generation))
+            {
                 return Ok(());
             }
             if old.file.target != snapshot.file.target
@@ -344,47 +437,97 @@ impl RecoveryStore {
             ));
         }
         let mut digest = Sha256::new();
-        for chunk in snapshot.snapshot.text.chunks() {
-            digest.update(chunk.as_bytes());
+        if !metadata_only {
+            for chunk in snapshot.snapshot.text.chunks() {
+                digest.update(chunk.as_bytes());
+            }
         }
         let header = Header {
-            schema: 1,
+            schema: if metadata_only { 2 } else { 1 },
             generation: snapshot.generation,
             epoch: snapshot.epoch,
             clean: snapshot.clean,
             document: snapshot.snapshot.document,
-            revision: snapshot.snapshot.revision,
-            encoding: snapshot.snapshot.encoding,
-            line_endings: snapshot.snapshot.line_endings,
-            language: snapshot.snapshot.language,
             file: snapshot.file,
             version: snapshot.version,
             pending_operation: snapshot.pending_operation,
             pending_revision: snapshot.pending_revision,
-            provisional_composition: snapshot.provisional_composition,
-            text_sha256: digest.finalize().into(),
+            draft: (!metadata_only).then(|| DraftMetadata {
+                revision: snapshot.snapshot.revision,
+                encoding: snapshot.snapshot.encoding,
+                line_endings: snapshot.snapshot.line_endings,
+                language: snapshot.snapshot.language,
+                provisional_composition: snapshot.provisional_composition,
+                text_sha256: digest.finalize().into(),
+            }),
         };
-        let bytes = serde_json::to_vec(&header).map_err(io_error)?;
+        self.persist(
+            &header,
+            (!snapshot.clean && !metadata_only).then_some(snapshot.snapshot.text.as_ref()),
+        )
+    }
+    fn persist(&self, header: &Header, text: Option<&Text>) -> Result<(), CoreError> {
+        self.persist_with_sync(header, text, |directory| File::open(directory)?.sync_all())
+    }
+    fn persist_with_sync(
+        &self,
+        header: &Header,
+        text: Option<&Text>,
+        sync_directory: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+    ) -> Result<(), CoreError> {
+        let bytes = serde_json::to_vec(header).map_err(io_error)?;
         if bytes.len() > 65536 {
             return Err(io_error("recovery header exceeds limit"));
         }
+        let path = self.path(header.document);
+        // Keep the unlinked inode readable until the metadata replacement is durable.
+        let previous = if header.schema == 2 {
+            match OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+            {
+                Ok(file) => Some(file),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(io_error(error)),
+            }
+        } else {
+            None
+        };
         let mut temporary = tempfile::NamedTempFile::new_in(&self.directory).map_err(io_error)?;
         temporary
             .write_all(&(bytes.len() as u32).to_be_bytes())
             .map_err(io_error)?;
         temporary.write_all(&bytes).map_err(io_error)?;
-        if !snapshot.clean {
-            for chunk in snapshot.snapshot.text.chunks() {
+        if let Some(text) = text {
+            for chunk in text.chunks() {
                 temporary.write_all(chunk.as_bytes()).map_err(io_error)?;
             }
         }
         temporary.as_file().sync_all().map_err(io_error)?;
-        temporary
-            .persist(self.path(header.document))
-            .map_err(io_error)?;
-        File::open(&self.directory)
-            .and_then(|f| f.sync_all())
-            .map_err(io_error)
+        temporary.persist(&path).map_err(io_error)?;
+        if let Err(error) = sync_directory(&self.directory) {
+            if header.schema == 2 {
+                let rollback = (|| {
+                    if let Some(mut previous) = previous {
+                        let mut original = tempfile::NamedTempFile::new_in(&self.directory)?;
+                        std::io::copy(&mut previous, &mut original)?;
+                        original.as_file().sync_all()?;
+                        original.persist(&path).map_err(|error| error.error)?;
+                    } else {
+                        fs::remove_file(&path)?;
+                    }
+                    File::open(&self.directory)?.sync_all()
+                })();
+                if let Err(rollback) = rollback {
+                    return Err(io_error(format!(
+                        "Recovery sync failed ({error}) and rollback is unconfirmed ({rollback})"
+                    )));
+                }
+            }
+            return Err(io_error(error));
+        }
+        Ok(())
     }
     pub fn restore(&self, document: DocumentID) -> Result<RecoverySnapshot, CoreError> {
         self.restore_budgeted(document).map(|(s, _)| s)
@@ -405,12 +548,15 @@ impl RecoveryStore {
         document: DocumentID,
     ) -> Result<(RecoverySnapshot, LoadBudget), CoreError> {
         let (h, file) = self.header(document)?;
-        if h.clean {
+        if h.clean || h.schema == 2 {
             return Err(CoreError::new(
                 ErrorCode::Unavailable,
                 "document has no unconfirmed recovery draft",
             ));
         }
+        let draft = h
+            .draft
+            .ok_or_else(|| io_error("recovery text metadata is missing"))?;
         let size = file.metadata().map_err(io_error)?.len();
         if size > MAX_DOCUMENT_BYTES as u64 + 65540 {
             return Err(io_error("recovery file exceeds limit"));
@@ -425,7 +571,7 @@ impl RecoveryStore {
             .read_to_end(&mut bytes)
             .map_err(io_error)?;
         if bytes.len() > MAX_DOCUMENT_BYTES
-            || <[u8; 32]>::from(Sha256::digest(&bytes)) != h.text_sha256
+            || <[u8; 32]>::from(Sha256::digest(&bytes)) != draft.text_sha256
         {
             return Err(io_error("recovery checksum/length mismatch"));
         }
@@ -434,17 +580,17 @@ impl RecoveryStore {
             RecoverySnapshot {
                 snapshot: DocumentSnapshot {
                     document: h.document,
-                    revision: h.revision,
+                    revision: draft.revision,
                     text: Arc::new(Text::from(text)),
-                    encoding: h.encoding,
-                    line_endings: h.line_endings,
-                    language: h.language,
+                    encoding: draft.encoding,
+                    line_endings: draft.line_endings,
+                    language: draft.language,
                 },
                 file: h.file,
                 version: h.version,
                 pending_operation: h.pending_operation,
                 pending_revision: h.pending_revision,
-                provisional_composition: h.provisional_composition,
+                provisional_composition: draft.provisional_composition,
                 generation: h.generation,
                 epoch: h.epoch,
                 lease: None,
@@ -465,5 +611,72 @@ struct RecoveryLock(File);
 impl Drop for RecoveryLock {
     fn drop(&mut self) {
         let _ = self.0.unlock();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_after_reference_replacement_restores_the_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let store = RecoveryStore::new(root.path().join("journal")).unwrap();
+        let document = DocumentID([1; 16]);
+        let target = TargetIdentity {
+            security_binding: vec![1],
+            effective_user: vec![2],
+            filesystem_namespace: vec![3],
+            container: None,
+        };
+        let text = "keep this draft";
+        let mut header = Header {
+            schema: 1,
+            clean: false,
+            document,
+            generation: 1,
+            epoch: 1,
+            file: FileRef {
+                target: target.clone(),
+                path: TargetPath::posix(b"/already-bound".to_vec()).unwrap(),
+                resolved_identity: None,
+            },
+            version: FileVersion {
+                target,
+                opaque_token: vec![1],
+                content_digest: [0; 32],
+                file_identity: vec![2],
+            },
+            pending_operation: Some(OperationID([2; 16])),
+            pending_revision: Some(BufferRevision(2)),
+            draft: Some(DraftMetadata {
+                text_sha256: Sha256::digest(text.as_bytes()).into(),
+                ..DraftMetadata::clean_marker(BufferRevision(2))
+            }),
+        };
+        store.persist(&header, Some(&Text::from(text))).unwrap();
+        let before = fs::read(store.path(document)).unwrap();
+        header.schema = 2;
+        header.draft = None;
+        header.generation += 1;
+        assert!(
+            store
+                .persist_with_sync(&header, None, |_| {
+                    assert_eq!(store.header(document).unwrap().0.schema, 2);
+                    Err(std::io::Error::other("injected directory sync failure"))
+                })
+                .is_err()
+        );
+        assert!(fs::read(store.path(document)).unwrap() == before);
+        assert_eq!(
+            store
+                .preview_budgeted(document)
+                .unwrap()
+                .0
+                .snapshot
+                .text
+                .as_str(),
+            text
+        );
     }
 }

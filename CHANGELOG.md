@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.1
+
+Preserve uncertain save references when explicitly discarding recovery text.
+
 ## 0.5.0
 
 Support target-side folder creation and repository cloning.

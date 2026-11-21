@@ -45,7 +45,15 @@ impl Journal {
     pub fn write(
         &self,
         store: Arc<RecoveryStore>,
+        snapshot: RecoverySnapshot,
+    ) -> Result<(), CoreError> {
+        self.write_mode(store, snapshot, false)
+    }
+    pub(crate) fn write_mode(
+        &self,
+        store: Arc<RecoveryStore>,
         mut snapshot: RecoverySnapshot,
+        metadata_only: bool,
     ) -> Result<(), CoreError> {
         let mut state = self
             .state
@@ -81,7 +89,7 @@ impl Journal {
         snapshot.epoch = session.epoch;
         snapshot.lease = Some(session.lease.clone());
         let generation = snapshot.generation;
-        session.store.write_sync(snapshot)?;
+        session.store.write_sync_mode(snapshot, metadata_only)?;
         state.persisted = Some(generation);
         Ok(())
     }

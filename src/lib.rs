@@ -119,6 +119,16 @@ impl Services {
             .map_err(|e| e.message)
     }
     #[cfg(unix)]
+    pub fn retain_recovery_save(
+        &self,
+        journal: &recovery::journal::Journal,
+        snapshot: buntrail_core::documents::RecoverySnapshot,
+    ) -> Result<(), String> {
+        journal
+            .write_mode(self.files()?.recovery(), snapshot, true)
+            .map_err(|e| e.message)
+    }
+    #[cfg(unix)]
     pub fn read_recovery(
         &self,
         document: buntrail_core::contracts::DocumentID,
@@ -224,15 +234,28 @@ impl Services {
         #[cfg(unix)]
         match string(request, "command")? {
             "recovery.list" => {
-                let store = self.files()?.recovery();
-                let entries = self.files()?.recovery().inventory().map_err(|e|e.message)?.into_iter()
-                    .map(|e|json!({"document":e.document,"file":e.file,"provisional":e.provisional,"unknown_save":e.unknown_save,"error":e.error,"active":store.active(e.document).unwrap_or(true)})).collect::<Vec<_>>();
+                let files = self.files()?;
+                let store = files.recovery();
+                let entries = store.inventory_with_recoverability().map_err(|e|e.message)?.into_iter()
+                    .map(|(e, recoverable)|json!({"document":e.document,"file":e.file,"provisional":e.provisional,"unknown_save":e.unknown_save,"error":e.error,"active":store.active(e.document).unwrap_or(true),"recoverable":recoverable,"local":e.file.as_ref().is_some_and(|file|files.is_local(&file.target))})).collect::<Vec<_>>();
                 return Ok(json!({"entries":entries}));
             }
             "recovery.discard" => {
-                self.discard_recovery(
-                    serde_json::from_value(request["document"].clone()).map_err(error)?,
-                )?;
+                let retain_pending_save = request
+                    .get("retain_pending_save")
+                    .map(|flag| {
+                        flag.as_bool()
+                            .ok_or("retain_pending_save must be a boolean")
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                self.files()?
+                    .recovery()
+                    .discard_with_pending(
+                        serde_json::from_value(request["document"].clone()).map_err(error)?,
+                        retain_pending_save,
+                    )
+                    .map_err(|e| e.message)?;
                 return Ok(Value::Null);
             }
             "recovery.inspect" => {
